@@ -45,3 +45,33 @@ def load_encrypted_data(secure_dir: Optional[Path]=None) -> dict:
         raise FileNotFoundError(f"Missing encrypted_data.json in {ep.parent}")
     enc = json.loads(ep.read_text(encoding="utf-8"))
     return {k: f.decrypt(v.encode()).decode() for k, v in enc.items()}
+
+# ... trong onuslibs/security/secure_manager.py
+import logging
+logger = logging.getLogger("onuslibs.security")
+
+def save_key(secure_dir: Path, key: bytes|None=None) -> Path:
+    kp = _key_path(secure_dir)
+    kp.parent.mkdir(parents=True, exist_ok=True)
+    key = key or Fernet.generate_key()
+    kp.write_bytes(key)
+    logger.info("Saved secret.key at %s", kp)
+    return kp
+
+def encrypt_env_to_file(env: dict, secure_dir: Path) -> Path:
+    key = load_key(secure_dir)
+    f = Fernet(key)
+    enc = {k: f.encrypt(str(v).encode()).decode() for k, v in env.items()}
+    ep = _enc_path(secure_dir)
+    ep.write_text(json.dumps(enc, ensure_ascii=False, indent=2), encoding="utf-8")
+    logger.info("Encrypted %d fields to %s", len(env), ep)
+    return ep
+
+def load_encrypted_data(secure_dir: Path) -> dict:
+    key = load_key(secure_dir)
+    f = Fernet(key)
+    ep = _enc_path(secure_dir)
+    enc = json.loads(ep.read_text(encoding="utf-8"))
+    out = {k: f.decrypt(v.encode()).decode() for k, v in enc.items()}
+    logger.debug("Decrypted %d fields from %s", len(out), ep)
+    return out

@@ -8,3 +8,4 @@ dist/
 .env.*
 secret.key
 encrypted_data.json
+/tests/*

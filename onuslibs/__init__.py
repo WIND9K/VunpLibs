@@ -2,3 +2,4 @@
 from .db_config import DB_CONFIG
 
 __all__ = ["connect_ui", "load_wallet_credentials", "DB_CONFIG"]
+__version__ = "1.1.0"
