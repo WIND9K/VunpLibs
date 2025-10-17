@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name="onuslibs",
-    version="1.0.0",  # bump major vì BREAKING CHANGE (bỏ onuslibs)
+    version="1.1.0",  # bump major vì BREAKING CHANGE (bỏ onuslibs)
     packages=find_packages(include=["onuslibs", "onuslibs.*"]),
     include_package_data=True,
     install_requires=[
