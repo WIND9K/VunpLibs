@@ -1,0 +1,6 @@
+keyring
+pydantic-settings
+python-dotenv
+cryptography
+httpx[http2]
+tenacity

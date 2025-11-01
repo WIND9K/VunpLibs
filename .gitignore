@@ -1,0 +1,50 @@
+﻿# --- Python bytecode & build artifacts ---
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+build/
+dist/
+
+# --- Virtual environments ---
+.venv/
+venv/
+
+# --- Environment files (DEV only) ---
+.env
+.env.*
+
+# --- Secrets (không commit khóa/secret thô) ---
+secret.key
+config/security/secret.key
+config/security/*.key
+encrypted_data.json
+
+# --- DLT / state / caches ---
+.dlt/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+*.log
+
+# --- Output files (ETL result, tạm) ---
+files/
+files/*.csv
+
+# --- Databases (không dùng DuckDB) ---
+*.duckdb
+*.db
+*.sqlite
+
+# --- Editors / OS junk ---
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# --- Git internals (phòng ngừa khi zip repo) ---
+.git
+
+# --- Tests folder (nếu có thư mục /test) ---
+/test/*

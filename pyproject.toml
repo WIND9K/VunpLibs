@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "onuslibs"
+version = "2.1.0"
+description = "OnusLibs v2 - ONUS API & DB helpers"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+  "httpx>=0.27",
+  "tenacity>=8.2",
+  "python-dotenv>=1.0",
+  "cryptography>=42.0",
+  "keyring>=25.0",
+  "pymysql>=1.1",
+  "dlt>=0.5"
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["onuslibs*"]
