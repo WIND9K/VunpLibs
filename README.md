@@ -374,3 +374,139 @@ Thiếu base URL
 
 Missing API token
 → Lưu vào Keyring onuslibs/ACCESS_CLIENT_TOKEN, hoặc cấu hình Fernet, hoặc bật ONUSLIBS_FALLBACK_ENV=true (DEV).
+
+Sử dụng module DB (MySQL)
+1) Chuẩn bị
+
+Cài phụ thuộc:
+
+python -m pip install pymysql keyring python-dotenv
+
+
+Khuyến nghị bảo mật bằng Keyring (dùng chung service với API):
+
+ONUSLIBS_SECRETS_BACKEND=keyring
+ONUSLIBS_FALLBACK_ENV=false
+ONUSLIBS_KEYRING_SERVICE=OnusLibs
+
+
+Nạp thông số DB vào Keyring (PowerShell):
+
+python -c "import keyring; s='OnusLibs'; keyring.set_password(s,'DB_HOST','<host>')"
+python -c "import keyring; s='OnusLibs'; keyring.set_password(s,'DB_USER','<user>')"
+python -c "import keyring; s='OnusLibs'; keyring.set_password(s,'DB_PASSWORD','<pass>')"
+python -c "import keyring; s='OnusLibs'; keyring.set_password(s,'DB_NAME','onusreport')"
+python -c "import keyring; s='OnusLibs'; keyring.set_password(s,'DB_PORT','3306')"
+python -c 'import keyring; keyring.set_password("OnusLibs","DB_SSL_CA","")'
+
+
+DEV có thể bật fallback ENV (không khuyến nghị cho PROD):
+
+ONUSLIBS_SECRETS_BACKEND=env
+ONUSLIBS_FALLBACK_ENV=true
+DB_HOST=...
+DB_USER=...
+DB_PASSWORD=...
+DB_NAME=...
+DB_PORT=3306
+DB_SSL_CA=
+
+2) API chính
+from onuslibs.db import healthcheck, query, execute, bulk_insert, transactional
+
+3) Kiểm tra nhanh
+python -c "from onuslibs.db import healthcheck; print('DB health:', healthcheck())"
+
+4) Ví dụ sử dụng
+
+a) SELECT → list[dict]
+
+from onuslibs.db import query
+
+rows = query(
+    "SELECT * FROM onusreport.onchain_diary WHERE date_utc >= %s AND date_utc < %s",
+    ("2025-10-30 00:00:00", "2025-10-31 00:00:00"),
+)
+print(len(rows), rows[:2])
+
+
+b) INSERT/UPDATE/DELETE đơn lẻ
+
+from onuslibs.db import execute
+
+# INSERT
+n = execute(
+    "INSERT INTO some_table (id, name, score) VALUES (%s, %s, %s)",
+    (1, "Alice", 10),
+)
+
+# UPDATE
+n = execute("UPDATE some_table SET score = score + 1 WHERE id=%s", (1,))
+
+# DELETE
+n = execute("DELETE FROM some_table WHERE id=%s", (1,))
+print("affected:", n)
+
+
+c) BULK INSERT (tự quote bảng/cột, hỗ trợ IGNORE/UPSERT)
+
+from onuslibs.db import bulk_insert
+
+rows = [
+    {"id": 1, "name": "Alice", "score": 10},
+    {"id": 2, "name": "Bob",   "score": 8},
+    {"id": 3, "name": "Cathy", "score": 9},
+]
+
+# 1) INSERT IGNORE (mặc định ignore_conflict=True)
+affected = bulk_insert(
+    table="onusreport.some_table",
+    rows=rows,
+    # columns=None -> tự suy từ keys của dòng đầu
+    ignore_conflict=True,      # INSERT IGNORE
+    on_duplicate_update=None,  # không upsert
+    chunk_size=1000,
+)
+
+# 2) UPSERT theo danh sách cột cập nhật
+affected = bulk_insert(
+    table="onusreport.some_table",
+    rows=rows,
+    on_duplicate_update=["name", "score"],  # ON DUPLICATE KEY UPDATE name=VALUES(name), score=VALUES(score)
+    ignore_conflict=False,                   # dùng upsert thay vì ignore
+)
+print("affected:", affected)
+
+
+d) Giao dịch (transaction)
+
+from onuslibs.db import transactional
+
+@transactional
+def do_transfer(conn, from_id: int, to_id: int, amount: int):
+    # Sử dụng connection được bơm vào (cursor dictionary=True)
+    with conn.cursor() as cur:
+        cur.execute("UPDATE wallet SET balance = balance - %s WHERE id=%s", (amount, from_id))
+        cur.execute("UPDATE wallet SET balance = balance + %s WHERE id=%s", (amount, to_id))
+    # commit/rollback do decorator xử lý
+
+do_transfer(100, 200, 50)
+
+5) Best practices
+
+Truy vấn theo khoảng thời gian [start, end) để tận dụng index thay vì DATE(col)=....
+
+Dùng tham số %s (parameterized) để tránh SQL injection.
+
+bulk_insert chia lô (chunk_size) để tránh statement quá lớn.
+
+6) Troubleshooting
+
+DB credentials not found (Keyring/ENV)
+→ Kiểm tra ONUSLIBS_KEYRING_SERVICE=OnusLibs và các key DB_* trong Keyring, hoặc bật fallback ENV cho DEV.
+
+SSL
+→ Nếu dùng SSL CA, lưu đường dẫn/nội dung cert vào DB_SSL_CA (tùy hạ tầng).
+
+Hiệu năng
+→ Ưu tiên index, hạn chế SELECT * trên bảng lớn; phân lô khi insert lớn.

@@ -47,4 +47,4 @@ Thumbs.db
 .git
 
 # --- Tests folder (nếu có thư mục /test) ---
-/test/*
+
