@@ -47,9 +47,14 @@ class RateLimiter:
         if wait > 0:
             _sleep(wait)
 
-# ... (giữ nguyên import & helpers & RateLimiter)
-
 class HttpClient:
+    """
+    HTTP client dựa trên httpx.Client với:
+    - HTTP/2 khi có 'h2' (ngược lại tự downgrade về HTTP/1.1).
+    - Timeout cấu hình được.
+    - Rate-limit theo req_per_sec (spacing cố định).
+    - Retry 429/5xx với backoff mũ nhỏ + jitter; tôn trọng Retry-After nếu có.
+    """
     def __init__(
         self,
         settings: Optional[OnusSettings] = None,
@@ -80,27 +85,72 @@ class HttpClient:
         if headers:
             default_headers.update(headers)
 
-        # NEW: proxies lấy từ settings.proxy (str|dict) nếu có, else None
-        proxies = getattr(self.settings, "proxy", None) or None  # httpx tự bỏ qua nếu None
-
-        self._client = httpx.Client(
+        # Chuẩn bị kwargs cho httpx.Client
+        client_kwargs = dict(
             http2=http2_enabled,
             timeout=timeout_s,
             verify=verify_ssl,
             headers=default_headers,
             transport=transport,
-            proxies=proxies,  # NEW
         )
 
-    def __enter__(self):  # NEW
+        # Tương thích nhiều phiên bản httpx: chỉ truyền proxies khi được hỗ trợ
+        proxies = getattr(self.settings, "proxy", None) or None  # httpx vẫn có thể lấy proxy từ ENV nếu None
+        try:
+            if proxies is not None:
+                self._client = httpx.Client(**client_kwargs, proxies=proxies)
+            else:
+                self._client = httpx.Client(**client_kwargs)
+        except TypeError:
+            # Phiên bản httpx không nhận tham số 'proxies' -> bỏ qua proxies
+            self._client = httpx.Client(**client_kwargs)
+
+    def __enter__(self):
         return self
 
-    def __exit__(self, exc_type, exc, tb):  # NEW
+    def __exit__(self, exc_type, exc, tb):
         self.close()
 
-    # ... (giữ nguyên _join, _is_retryable_status, _compute_retry_after, _backoff_delay)
+    def close(self) -> None:
+        try:
+            self._client.close()
+        except Exception:
+            pass
 
-    # NEW: tổng quát hoá logic vào _request()
+    def _join(self, path: str) -> str:
+        base = (getattr(self.settings, "base_url", "") or "").rstrip("/")
+        if path.startswith("http://") or path.startswith("https://"):
+            return path
+        if not base:
+            raise ValueError("base_url is empty; set ONUSLIBS_BASE_URL")
+        return base + path if path.startswith("/") else base + "/" + path
+
+    @staticmethod
+    def _is_retryable_status(status_code: int) -> bool:
+        return status_code == 429 or (500 <= status_code <= 599)
+
+    def _compute_retry_after(self, response: httpx.Response) -> Optional[float]:
+        ra = response.headers.get("Retry-After")
+        if not ra:
+            return None
+        try:  # numeric seconds
+            secs = float(ra.strip())
+            if secs >= 0:
+                return secs
+        except ValueError:
+            pass
+        try:  # HTTP-date
+            dt = parsedate_to_datetime(ra)
+            delta = dt.timestamp() - time.time()
+            return max(0.0, delta)
+        except Exception:
+            return None
+
+    def _backoff_delay(self, attempt: int) -> float:
+        base = min(self.backoff_cap, self.backoff_base * (2 ** attempt))
+        # thêm jitter nhẹ để tránh thác lũ
+        return min(self.backoff_cap, base + self.jitter_fn(0.0, self.backoff_base / 4.0))
+
     def _request(
         self,
         method: str,
@@ -147,7 +197,6 @@ class HttpClient:
             last_response.raise_for_status()
         raise RuntimeError("HttpClient._request: unexpected fallthrough")
 
-    # Giữ get() nhưng dùng _request()
     def get(
         self,
         path: str,
@@ -157,7 +206,6 @@ class HttpClient:
     ) -> httpx.Response:
         return self._request("GET", path, params=params, headers=headers)
 
-    # NEW: thêm post/put/delete cho đủ bộ
     def post(
         self,
         path: str,
