@@ -30,7 +30,7 @@ def main(userid: str):
     for r in rows:
         print(r)
 
-    from tools.print_json import print_json
-    print_json(rows, sort_keys=True)
+    # from tools.print_json import print_json
+    # print_json(rows, sort_keys=True)
 if __name__ == "__main__":
     main("6277729722014433182")

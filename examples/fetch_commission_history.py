@@ -1,4 +1,184 @@
 # -*- coding: utf-8 -*-
+from __future__ import annotations
+# === DEBUG FLOW helpers ===
+import time, threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from math import ceil
+from typing import Iterable, Tuple
+
+def _sleep_ms(ms: int):
+    if ms and ms > 0:
+        time.sleep(ms / 1000.0)
+
+def _headers_lower(resp) -> dict:
+    return {k.lower(): v for k, v in resp.headers.items()}
+
+def _extract_items_loc(payload: Any) -> List[Dict[str, Any]]:
+    # list -> pageItems -> items -> []
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, dict):
+        if isinstance(payload.get("pageItems"), list):
+            return list(payload["pageItems"])
+        if isinstance(payload.get("items"), list):
+            return list(payload["items"])
+    return []
+
+from httpx import HTTPStatusError
+def header_fetch_all_seq_debug(
+    http_client: Any,
+    endpoint: str,
+    *,
+    params: Dict[str, Any],
+    headers: Dict[str, str],
+    page_size: int,
+    delay_ms: int = 0,
+    max_pages: Optional[int] = None,
+) -> Iterable[List[Dict[str, Any]]]:
+    page = int(params.get("page", 0) or 0)
+    taken = 0
+    while True:
+        p = dict(params); p["page"] = page; p["pageSize"] = page_size
+        print(f"[SEQ] → Request page={page} pageSize={page_size}")
+        _sleep_ms(delay_ms)
+        try:
+            resp = http_client.get(endpoint, params=p, headers=headers)
+            print(f"[SEQ] ← Status={resp.status_code} page={page}")
+            resp.raise_for_status()
+            items = _extract_items_loc(resp.json())
+            h = _headers_lower(resp)
+            if page == 0:
+                print("[SEQ] X-Total-Count:", h.get("x-total-count"), "| X-Page-Count:", h.get("x-page-count"))
+
+            has_next = (h.get("x-has-next-page") or "").lower() == "true"
+            print(f"[SEQ] • Yield page={page} items={len(items)} has_next={has_next}")
+        except HTTPStatusError as e:
+            code = e.response.status_code
+            if code in (400, 404, 422):
+                print(f"[SEQ] stop: page={page} out-of-range (HTTP {code})")
+                return
+            raise  # lỗi khác thì nổi lên
+
+        items = _extract_items_loc(resp.json())
+        h = _headers_lower(resp)
+        has_next = (h.get("x-has-next-page") or "").lower() == "true"
+        print(f"[SEQ] • Yield page={page} items={len(items)} has_next={has_next}")
+        yield items
+
+        if not has_next or not items:
+            print("[SEQ] done (no next/empty batch)")
+            return
+        page += 1
+        
+def header_fetch_all_parallel_debug(
+    http_client: Any,
+    endpoint: str,
+    *,
+    params: Dict[str, Any],
+    headers: Dict[str, str],
+    page_size: int,
+    delay_ms: int = 0,
+    max_pages: Optional[int] = None,
+    workers: Optional[int] = None,
+) -> Iterable[List[Dict[str, Any]]]:
+    # Lấy page 0 trước để đọc header
+    p0 = int(params.get("page", 0) or 0)
+    p = dict(params); p["page"] = p0; p["pageSize"] = page_size
+    print(f"[PAR] → Request page={p0} (bootstrap) pageSize={page_size}")
+    _sleep_ms(delay_ms)
+    resp0 = http_client.get(endpoint, params=p, headers=headers)
+    print(f"[PAR] ← Status={resp0.status_code} page={p0}")
+    resp0.raise_for_status()
+    items0 = _extract_items_loc(resp0.json())
+    hdr0 = _headers_lower(resp0)
+    if not items0:
+        print("[PAR] page0 empty → stop")
+        return
+    print(f"[PAR] • Yield page={p0} items={len(items0)} (bootstrap)")
+    yield items0
+
+    # Tính tổng trang
+    last_page_idx = None
+    pc = (hdr0.get("x-page-count") or "").strip()
+    if pc.isdigit():
+        last_page_idx = max(0, int(pc) - 1)
+    else:
+        tc = (hdr0.get("x-total-count") or "").strip()
+        if tc.isdigit() and page_size > 0:
+            total = int(tc)
+            last_page_idx = max(0, ceil(total / page_size) - 1) if total > 0 else 0
+
+    # Nếu không tính được tổng trang → fallback tuần tự cho phần còn lại
+    if last_page_idx is None:
+        print("[PAR] cannot infer total pages → fallback SEQ for remainder")
+        for batch in header_fetch_all_seq_debug(
+            http_client, endpoint,
+            params={**params, "page": p0 + 1},
+            headers=headers,
+            page_size=page_size,
+            delay_ms=delay_ms,
+            max_pages=max_pages,
+        ):
+            yield batch
+        return
+
+    start = p0 + 1
+    end   = last_page_idx
+    if max_pages is not None:
+        end = min(end, start + max_pages - 1)
+    if end < start:
+        print("[PAR] no remaining pages")
+        return
+
+    # workers
+    if workers is None:
+        try:
+            from onuslibs.config.settings import OnusSettings
+            workers = max(1, int(OnusSettings().max_inflight))
+        except Exception:
+            workers = 4
+    workers = max(1, min(int(workers), 16))  # clamp an toàn
+
+    print(f"[PAR] plan: workers={workers} fetch pages {start}..{end}")
+
+    
+    def _fetch(i: int) -> Tuple[int, List[Dict[str, Any]]]:
+        tp = threading.get_ident()
+        pp = dict(params); pp["page"] = i; pp["pageSize"] = page_size
+        print(f"[PAR][T{tp}] → Request page={i}")
+        _sleep_ms(delay_ms)
+        try:
+            r = http_client.get(endpoint, params=pp, headers=headers)
+            print(f"[PAR][T{tp}] ← Status={r.status_code} page={i}")
+            r.raise_for_status()
+        except HTTPStatusError as e:
+            code = e.response.status_code
+            if code in (400, 404, 422):   # coi như page vượt phạm vi
+                print(f"[PAR][T{tp}] stop page={i} out-of-range (HTTP {code})")
+                return i, []
+            raise
+        items = _extract_items_loc(r.json())
+        print(f"[PAR][T{tp}] • Done page={i} items={len(items)}")
+        return i, items
+
+    buffer: Dict[int, List[Dict[str, Any]]] = {}
+    next_to_yield = start
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futs = {ex.submit(_fetch, i): i for i in range(start, end + 1)}
+        for fut in as_completed(futs):
+            i, items = fut.result()
+            buffer[i] = items
+            while next_to_yield in buffer:
+                b = buffer.pop(next_to_yield)
+                if b:
+                    print(f"[PAR] • Yield page={next_to_yield} items={len(b)}")
+                    yield b
+                else:
+                    print(f"[PAR] • Skip empty page={next_to_yield}")
+                next_to_yield += 1
+
+    print("[PAR] done")
+
 """
 Fetch commission history (VNDC) qua OnusLibs Facade – cấu hình tách ở đầu trang.
 
@@ -8,7 +188,6 @@ Chạy mẫu:
   python -m examples.fetch_commission_history --date 2025-10-11 --fields date,amount,description
 """
 
-from __future__ import annotations
 import os
 import sys
 import argparse
@@ -144,6 +323,14 @@ def try_get_api_total_count(settings: OnusSettings, endpoint: str, params: Dict[
     try:
         resp = cli.get(endpoint, params=p, headers=hdrs)
         resp.raise_for_status()
+        items = _extract_items_loc(resp.json())
+        h = _headers_lower(resp)
+        if page == 0:
+            print("[SEQ] X-Total-Count:", h.get("x-total-count"), "| X-Page-Count:", h.get("x-page-count"))
+
+        has_next = (h.get("x-has-next-page") or "").lower() == "true"
+        print(f"[SEQ] • Yield page={page} items={len(items)} has_next={has_next}")
+
         headers_l = {k.lower(): v for k, v in resp.headers.items()}
         return _parse_int(headers_l.get("x-total-count"))
     except Exception:
@@ -173,6 +360,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     p.add_argument("--out-json", help="Ghi ra file JSON.", default=None)
     # Bạn có thể thêm --out-csv nếu muốn, dùng tools.write_csv
+        # Flow quan sát
+    p.add_argument("--parallel", action="store_true", help="Bật phân trang đa luồng (song song).")
+    p.add_argument("--workers", type=int, default=None, help="Số luồng khi chạy --parallel (mặc định lấy từ ENV).")
+    p.add_argument("--debug-flow", action="store_true", help="In log trực quan từng request/trang.")
+    p.add_argument("--delay-ms", type=int, default=0, help="Ngủ (ms) trước MỖI request để dễ quan sát.")
+    p.add_argument("--max-pages", type=int, default=None, help="Giới hạn số trang tải (chỉ cho demo quan sát).")
+
     return p
 
 def main(argv: List[str]) -> int:
@@ -198,37 +392,75 @@ def main(argv: List[str]) -> int:
 
     # 3) Fetch
     s = OnusSettings()  # tự nạp ENV/.env
+        # 3) Fetch
+    s = OnusSettings()  # tự nạp ENV/.env
+
+    pager_override = None
+    if args.debug_flow:
+        if args.parallel:
+            def pager_override(cli, ep, params=None, headers=None, page_size=None):
+                return header_fetch_all_parallel_debug(
+                    cli, ep,
+                    params=params or {},
+                    headers=headers or {},
+                    page_size=page_size or args.page_size,
+                    delay_ms=args.delay_ms,
+                    max_pages=args.max_pages,
+                    workers=args.workers,
+                )
+        else:
+            def pager_override(cli, ep, params=None, headers=None, page_size=None):
+                return header_fetch_all_seq_debug(
+                    cli, ep,
+                    params=params or {},
+                    headers=headers or {},
+                    page_size=page_size or args.page_size,
+                    delay_ms=args.delay_ms,
+                    max_pages=args.max_pages,
+                )
+
+    print(f"RUN MODE: {'PARALLEL' if args.parallel else 'SEQUENTIAL'} | DEBUG={args.debug_flow} | DELAY={args.delay_ms}ms")
+    total = {"n": 0}
+    def _count_batch(items: List[Dict[str, Any]]) -> None:
+        total["n"] += len(items)
+        # In tiến độ khi debug-flow để dễ quan sát
+        if args.debug_flow:
+            print(f"[SUM] +{len(items)} → running_total={total['n']}")
+
     rows: List[Dict[str, Any]] = fetch_json(
         endpoint=ENDPOINT,
         params=params,
-        fields=fields,          # list[str]
-        paginate=True,          # lịch sử → nên phân trang
-        page_size=args.page_size,
-        order_by=None,          # đã set orderBy trong params
+        fields=fields,              # list[str]
+        paginate=True,              # lịch sử → nên phân trang
+        page_size=args.page_size,   # ghi đè ENV khi cần
+        order_by=None,              # đã set orderBy trong params
         settings=s,
         unique_key=None,
-        parallel=True,
+        parallel=(args.parallel and not pager_override),  # nếu tự override pager thì parallel=False ở facade
+        pager_func=pager_override,
+        on_batch=_count_batch,     
     )
+    print(f"[SUMMARY] total_items={len(rows)}")
 
     # 4) Xuất & thống kê
-    if args.out_json:
-        # print_json(rows, to_file=args.out_json)
-        print(f"Đã ghi JSON: {len(rows)} dòng -> {args.out_json}")
-    else:
-        print_json(rows)
-        print(f"\nTotal fetched rows: {len(rows)}")
+    # if args.out_json:
+    #     # print_json(rows, to_file=args.out_json)
+    #     print(f"Đã ghi JSON: {len(rows)} dòng -> {args.out_json}")
+    # else:
+    #     print_json(rows)
+    #     print(f"\nTotal fetched rows: {len(rows)}")
 
-    api_total = try_get_api_total_count(s, ENDPOINT, params)
-    if api_total is not None:
-        print(f"API reported X-Total-Count: {api_total}")
+    # api_total = try_get_api_total_count(s, ENDPOINT, params)
+    # if api_total is not None:
+    #     print(f"API reported X-Total-Count: {api_total}")
 
     
 
-    from tools.write_csv import write_csv
+    # from tools.write_csv import write_csv
 
-    out = "commission_history.csv"
-    n = write_csv(rows, out)  # auto dò cột, tự flatten nested dict
-    print(f"Đã ghi {n} dòng vào {out}")
+    # out = "commission_history.csv"
+    # n = write_csv(rows, out)  # auto dò cột, tự flatten nested dict
+    # print(f"Đã ghi {n} dòng vào {out}")
 
     return 0
 if __name__ == "__main__":
