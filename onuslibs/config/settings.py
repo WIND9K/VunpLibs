@@ -1,4 +1,5 @@
 from __future__ import annotations
+
 import os
 import platform
 from dataclasses import dataclass
@@ -19,6 +20,7 @@ def _auto_load_env_once() -> None:
       - python-dotenv có sẵn, VÀ
       - ONUSLIBS_AUTO_DOTENV=true (mặc định), VÀ
       - tìm thấy file .env (hoặc có ONUSLIBS_DOTENV_PATH)
+
     Không cài python-dotenv -> bỏ qua yên lặng (không raise).
     """
     global _ENV_LOADED
@@ -101,6 +103,13 @@ class OnusSettings:
     # 0 hoặc None => không segment, dùng 1 datePeriod như cũ
     date_segment_hours: int | None = None
 
+    # NEW: điều khiển chạy song song giữa các segment datePeriod
+    # True  => cho phép đa luồng (ThreadPoolExecutor) trên segment
+    # False => chạy tuần tự từng segment
+    segment_parallel: bool | None = None
+    # NEW: giới hạn số worker cho segment (None => dùng max_inflight)
+    segment_max_workers: int | None = None
+
     # ====== Secrets backend (Module 2) ======
     secrets_backend: str | None = None  # "keyring" | "env"
     keyring_service: str | None = None
@@ -114,7 +123,7 @@ class OnusSettings:
     proxy: str | None = None
     verify_ssl: bool | None = None
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         # Tự nạp .env (nếu có python-dotenv)
         _auto_load_env_once()
 
@@ -127,9 +136,25 @@ class OnusSettings:
 
         # NEW: số giờ tối đa cho mỗi segment datePeriod
         # 0 => tắt segment, dùng nguyên khoảng datePeriod
-        self.date_segment_hours = self.date_segment_hours or _i(
-            "ONUSLIBS_DATE_SEGMENT_HOURS", 0
+        self.date_segment_hours = (
+            self.date_segment_hours
+            if self.date_segment_hours is not None
+            else _i("ONUSLIBS_DATE_SEGMENT_HOURS", 0)
         )
+
+        # NEW: điều khiển segment song song
+        self.segment_parallel = _b(
+            "ONUSLIBS_SEGMENT_PARALLEL",
+            True if self.segment_parallel is None else bool(self.segment_parallel),
+        )
+
+        # NEW: số worker tối đa cho segment (<=0 => None => dùng max_inflight)
+        raw_workers = (
+            self.segment_max_workers
+            if self.segment_max_workers is not None
+            else _i("ONUSLIBS_SEGMENT_MAX_WORKERS", 0)
+        )
+        self.segment_max_workers = raw_workers if isinstance(raw_workers, int) and raw_workers > 0 else None
 
         # http2 mặc định True; cho phép override bằng ENV
         self.http2 = True if self.http2 is None else bool(self.http2)
@@ -145,7 +170,8 @@ class OnusSettings:
             self.keyring_service or os.getenv("ONUSLIBS_KEYRING_SERVICE", "OnusLibs")
         )
         self.keyring_item = (
-            self.keyring_item or os.getenv("ONUSLIBS_KEYRING_ITEM", "ACCESS_CLIENT_TOKEN")
+            self.keyring_item
+            or os.getenv("ONUSLIBS_KEYRING_ITEM", "ACCESS_CLIENT_TOKEN")
         )
         self.fall_back_env = _b(
             "ONUSLIBS_FALLBACK_ENV",
@@ -158,8 +184,11 @@ class OnusSettings:
 
         # Optional hiển thị/log
         self.log_level = self.log_level or os.getenv("ONUSLIBS_LOG_LEVEL", "INFO")
-        # giữ UA tổng quát (tránh hardcode platform)
-        self.user_agent = self.user_agent or f"OnusLibs/3 (Python {os.sys.version.split()[0]})"
+        # Dùng platform thay vì os.sys để tránh cảnh báo type checker
+        self.user_agent = (
+            self.user_agent
+            or f"OnusLibs/3 (Python {platform.python_version()})"
+        )
         self.proxy = self.proxy or os.getenv("ONUSLIBS_PROXY") or None
         self.verify_ssl = _b(
             "ONUSLIBS_VERIFY_SSL",
@@ -175,19 +204,29 @@ class OnusSettings:
         bu = self.base_url.strip().lower()
         if not (bu.startswith("http://") or bu.startswith("https://")):
             raise ConfigError("ONUSLIBS_BASE_URL must start with http:// or https://")
+
         if not isinstance(self.page_size, int) or self.page_size < 1:
             raise ConfigError("ONUSLIBS_PAGE_SIZE must be >= 1")
+
         if not isinstance(self.req_per_sec, (int, float)) or self.req_per_sec <= 0:
             raise ConfigError("ONUSLIBS_REQ_PER_SEC must be > 0")
+
         if not isinstance(self.timeout_s, (int, float)) or self.timeout_s <= 0:
             raise ConfigError("ONUSLIBS_TIMEOUT_S must be > 0")
+
         if not isinstance(self.max_inflight, int) or self.max_inflight < 1:
             raise ConfigError("ONUSLIBS_MAX_INFLIGHT must be >= 1")
+
         if not isinstance(self.token_header, str) or not self.token_header.strip():
             raise ConfigError("ONUSLIBS_TOKEN_HEADER is empty.")
+
         # NEW: kiểm tra date_segment_hours >= 0
         if not isinstance(self.date_segment_hours, int) or self.date_segment_hours < 0:
             raise ConfigError("ONUSLIBS_DATE_SEGMENT_HOURS must be >= 0")
+
+        # NEW: nếu segment_max_workers có set thì phải >=1 (thực tế đã normalize, đây là chặn double)
+        if self.segment_max_workers is not None and self.segment_max_workers < 1:
+            raise ConfigError("ONUSLIBS_SEGMENT_MAX_WORKERS must be >= 1 if set")
 
     def to_dict(self) -> dict:
         return {
@@ -197,7 +236,9 @@ class OnusSettings:
             "max_inflight": self.max_inflight,
             "timeout_s": self.timeout_s,
             "http2": self.http2,
-            "date_segment_hours": self.date_segment_hours,  # NEW
+            "date_segment_hours": self.date_segment_hours,
+            "segment_parallel": self.segment_parallel,
+            "segment_max_workers": self.segment_max_workers,
             "secrets_backend": self.secrets_backend,
             "keyring_service": self.keyring_service,
             "keyring_item": self.keyring_item,

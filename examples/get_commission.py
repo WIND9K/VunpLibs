@@ -4,7 +4,7 @@ Fetch commission history (VNDC) qua OnusLibs Facade – cấu hình tách ở đ
 
 Chạy mẫu:
   python -m examples.fetch_commission_history --date 2025-10-11
-  python -m examples.fetch_commission_history --start-date 2025-10-01 --end-date 2025-10-11 --preset full
+  python -m examples.fetch_commission_history --start-date 2025-10-11 --end-date 2025-10-11 --preset basic
   python -m examples.fetch_commission_history --date 2025-10-11 --fields date,amount,description
 """
 

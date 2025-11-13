@@ -118,10 +118,14 @@ def main(argv: List[str]) -> int:
 
     total = len(rows)
     print(f"Total fetched rows: {total}")
+    
+    # 4) Xuất & thống kê
+    from tools.print_json import print_json
+    print_json(len(rows))
 
-    if args.debug_count and total > 0:
-        print("Sample row[0]:")
-        print(rows[0])
+    # if args.debug_count and total > 0:
+        # print("Sample row[0]:")
+        # print(rows[0])
 
     return 0
 
