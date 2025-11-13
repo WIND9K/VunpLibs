@@ -1,5 +1,6 @@
 from __future__ import annotations
 import os
+import platform
 from dataclasses import dataclass
 
 # ====== Auto .env loader (an toàn, tuỳ chọn) ======
@@ -10,6 +11,7 @@ except Exception:  # python-dotenv có thể không được cài
     find_dotenv = None
 
 _ENV_LOADED = False  # đảm bảo chỉ load .env một lần / process
+
 
 def _auto_load_env_once() -> None:
     """
@@ -25,13 +27,21 @@ def _auto_load_env_once() -> None:
     _ENV_LOADED = True
 
     # Bật/tắt auto dotenv
-    auto = os.getenv("ONUSLIBS_AUTO_DOTENV", "true").strip().lower() in ("1", "true", "yes", "on")
+    auto = os.getenv("ONUSLIBS_AUTO_DOTENV", "true").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
     if not auto or load_dotenv is None:
         return
 
     # Cho phép chỉ định file .env
     path = os.getenv("ONUSLIBS_DOTENV_PATH", "").strip() or None
-    override = os.getenv("ONUSLIBS_DOTENV_OVERRIDE", "false").strip().lower() in ("1", "true", "yes", "on")
+    override = (
+        os.getenv("ONUSLIBS_DOTENV_OVERRIDE", "false").strip().lower()
+        in ("1", "true", "yes", "on")
+    )
 
     if path and os.path.exists(path):
         load_dotenv(path, override=override)
@@ -50,6 +60,7 @@ def _b(name: str, default: bool = False) -> bool:
         return default
     return v.strip().lower() in ("1", "true", "yes", "on")
 
+
 def _i(name: str, default: int) -> int:
     v = os.getenv(name)
     if v is None:
@@ -58,6 +69,7 @@ def _i(name: str, default: int) -> int:
         return int(v)
     except Exception:
         return default
+
 
 def _f(name: str, default: float) -> float:
     v = os.getenv(name)
@@ -71,6 +83,7 @@ def _f(name: str, default: float) -> float:
 
 class ConfigError(ValueError):
     """Lỗi cấu hình OnusLibs (thiếu/sai ENV, base_url...)."""
+
     pass
 
 
@@ -78,18 +91,22 @@ class ConfigError(ValueError):
 class OnusSettings:
     # ====== Runtime chính (ENV-first) ======
     base_url: str | None = None
-    page_size: int | None = None
+    page_size: int | None = None  # <- default từ ENV; app không cần truyền
     req_per_sec: float | None = None
     max_inflight: int | None = None
     timeout_s: float | None = None
     http2: bool | None = None
 
+    # NEW: chia nhỏ datePeriod theo ENV (giờ)
+    # 0 hoặc None => không segment, dùng 1 datePeriod như cũ
+    date_segment_hours: int | None = None
+
     # ====== Secrets backend (Module 2) ======
-    secrets_backend: str | None = None      # "keyring" | "env"
+    secrets_backend: str | None = None  # "keyring" | "env"
     keyring_service: str | None = None
     keyring_item: str | None = None
-    fall_back_env: bool | None = None       # true => cho phép đọc token từ ENV
-    token_header: str | None = None         # tên header chứa token
+    fall_back_env: bool | None = None  # true => cho phép đọc token từ ENV
+    token_header: str | None = None  # tên header chứa token
 
     # (tuỳ chọn hiển thị/log, client sẽ getattr nếu thiếu)
     log_level: str | None = None
@@ -102,30 +119,52 @@ class OnusSettings:
         _auto_load_env_once()
 
         # ==== Đọc ENV ====
-        self.base_url       = self.base_url or os.getenv("ONUSLIBS_BASE_URL", "").strip()
-        self.page_size      = self.page_size or _i("ONUSLIBS_PAGE_SIZE",     10000)
-        self.req_per_sec    = self.req_per_sec or _f("ONUSLIBS_REQ_PER_SEC", 2.0)
-        self.max_inflight   = self.max_inflight or _i("ONUSLIBS_MAX_INFLIGHT", 4)
-        self.timeout_s      = self.timeout_s or _f("ONUSLIBS_TIMEOUT_S",     60.0)
+        self.base_url = self.base_url or os.getenv("ONUSLIBS_BASE_URL", "").strip()
+        self.page_size = self.page_size or _i("ONUSLIBS_PAGE_SIZE", 20000)  # ENV-first
+        self.req_per_sec = self.req_per_sec or _f("ONUSLIBS_REQ_PER_SEC", 2.0)
+        self.max_inflight = self.max_inflight or _i("ONUSLIBS_MAX_INFLIGHT", 4)
+        self.timeout_s = self.timeout_s or _f("ONUSLIBS_TIMEOUT_S", 60.0)
+
+        # NEW: số giờ tối đa cho mỗi segment datePeriod
+        # 0 => tắt segment, dùng nguyên khoảng datePeriod
+        self.date_segment_hours = self.date_segment_hours or _i(
+            "ONUSLIBS_DATE_SEGMENT_HOURS", 0
+        )
 
         # http2 mặc định True; cho phép override bằng ENV
-        self.http2          = True if self.http2 is None else bool(self.http2)
-        self.http2          = _b("ONUSLIBS_HTTP2", self.http2)
+        self.http2 = True if self.http2 is None else bool(self.http2)
+        self.http2 = _b("ONUSLIBS_HTTP2", self.http2)
 
-        self.secrets_backend= (self.secrets_backend or os.getenv("ONUSLIBS_SECRETS_BACKEND", "keyring")).lower()
+        self.secrets_backend = (
+            self.secrets_backend or os.getenv("ONUSLIBS_SECRETS_BACKEND", "keyring")
+        ).lower()
         if self.secrets_backend not in ("keyring", "env"):
             self.secrets_backend = "keyring"
 
-        self.keyring_service= self.keyring_service or os.getenv("ONUSLIBS_KEYRING_SERVICE", "OnusLibs")
-        self.keyring_item   = self.keyring_item or os.getenv("ONUSLIBS_KEYRING_ITEM", "ACCESS_CLIENT_TOKEN")
-        self.fall_back_env  = _b("ONUSLIBS_FALLBACK_ENV", self.fall_back_env if self.fall_back_env is not None else False)
-        self.token_header   = self.token_header or os.getenv("ONUSLIBS_TOKEN_HEADER", "Access-Client-Token")
+        self.keyring_service = (
+            self.keyring_service or os.getenv("ONUSLIBS_KEYRING_SERVICE", "OnusLibs")
+        )
+        self.keyring_item = (
+            self.keyring_item or os.getenv("ONUSLIBS_KEYRING_ITEM", "ACCESS_CLIENT_TOKEN")
+        )
+        self.fall_back_env = _b(
+            "ONUSLIBS_FALLBACK_ENV",
+            self.fall_back_env if self.fall_back_env is not None else False,
+        )
+        self.token_header = (
+            self.token_header
+            or os.getenv("ONUSLIBS_TOKEN_HEADER", "Access-Client-Token")
+        )
 
         # Optional hiển thị/log
-        self.log_level      = self.log_level or os.getenv("ONUSLIBS_LOG_LEVEL", "INFO")
-        self.user_agent     = self.user_agent or f"OnusLibs/3 (Python {os.sys.version.split()[0]}; Windows)"
-        self.proxy          = self.proxy or os.getenv("ONUSLIBS_PROXY") or None
-        self.verify_ssl     = _b("ONUSLIBS_VERIFY_SSL", True if self.verify_ssl is None else bool(self.verify_ssl))
+        self.log_level = self.log_level or os.getenv("ONUSLIBS_LOG_LEVEL", "INFO")
+        # giữ UA tổng quát (tránh hardcode platform)
+        self.user_agent = self.user_agent or f"OnusLibs/3 (Python {os.sys.version.split()[0]})"
+        self.proxy = self.proxy or os.getenv("ONUSLIBS_PROXY") or None
+        self.verify_ssl = _b(
+            "ONUSLIBS_VERIFY_SSL",
+            True if self.verify_ssl is None else bool(self.verify_ssl),
+        )
 
         self._validate()
 
@@ -146,6 +185,9 @@ class OnusSettings:
             raise ConfigError("ONUSLIBS_MAX_INFLIGHT must be >= 1")
         if not isinstance(self.token_header, str) or not self.token_header.strip():
             raise ConfigError("ONUSLIBS_TOKEN_HEADER is empty.")
+        # NEW: kiểm tra date_segment_hours >= 0
+        if not isinstance(self.date_segment_hours, int) or self.date_segment_hours < 0:
+            raise ConfigError("ONUSLIBS_DATE_SEGMENT_HOURS must be >= 0")
 
     def to_dict(self) -> dict:
         return {
@@ -155,6 +197,7 @@ class OnusSettings:
             "max_inflight": self.max_inflight,
             "timeout_s": self.timeout_s,
             "http2": self.http2,
+            "date_segment_hours": self.date_segment_hours,  # NEW
             "secrets_backend": self.secrets_backend,
             "keyring_service": self.keyring_service,
             "keyring_item": self.keyring_item,
@@ -165,5 +208,6 @@ class OnusSettings:
             "proxy": self.proxy,
             "verify_ssl": self.verify_ssl,
         }
+
 
 __all__ = ["OnusSettings", "ConfigError"]

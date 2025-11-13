@@ -1,168 +1,253 @@
-# onuslibs/pagination/header_pager.py
-# =============================================================================
-# HeaderPager: Phân trang theo chuẩn header của Cyclos/Wallet
-# - Ưu tiên suy ra tổng trang từ X-Page-Count / X-Total-Count
-# - Nếu không có, fallback X-Has-Next-Page; nếu vẫn "khó tin", dùng kích thước batch
-# - Dừng êm khi server trả 400/404/422 (coi như page vượt phạm vi/hết trang)
-# =============================================================================
-
 from __future__ import annotations
 
-from math import ceil                     # dùng để tính số trang từ total/page_size
-from typing import Any, Dict, Iterable, List, Optional
-from httpx import HTTPStatusError         # để bắt lỗi trạng thái HTTP cấp ứng dụng
+"""
+OnusLibs v3 — Module 4: Pagination (HeaderPager)
 
+- Dùng header phân trang kiểu Cyclos:
+    X-Total-Count, X-Page-Size, X-Current-Page, X-Page-Count, X-Has-Next-Page
+- Làm việc với HttpClient (duck-typed: chỉ cần có .get() trả về httpx.Response).
+- Không import ngược lại unified -> tránh vòng lặp import.
+"""
+
+from typing import Any, Dict, Iterable, List, Mapping, Optional
+
+import httpx
 
 __all__ = ["HeaderPager", "header_fetch_all"]
 
 
-# -----------------------------------------------------------------------------
-# Helpers (private)
-# -----------------------------------------------------------------------------
-def _lower_headers(h: Any) -> Dict[str, str]:
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _normalize_bool(val: Optional[str]) -> Optional[bool]:
     """
-    Chuẩn hoá header về chữ thường để tra cứu khoẻ:
-    - httpx.Headers có thể key theo case-insensitive; ta ép về dict[str,str].
+    Chuẩn hóa chuỗi header bool ("true"/"false"/"1"/"0"/...) về bool / None.
     """
-    return {str(k).lower(): str(v) for k, v in dict(h).items()}
+    if val is None:
+        return None
+    s = val.strip().lower()
+    if not s:
+        return None
+    if s in ("true", "1", "yes", "y", "on"):
+        return True
+    if s in ("false", "0", "no", "n", "off"):
+        return False
+    return None
+
+
+def _parse_int(val: Optional[str]) -> Optional[int]:
+    """
+    Chuẩn hóa chuỗi header số về int / None.
+    """
+    if val is None:
+        return None
+    s = val.strip()
+    if not s:
+        return None
+    try:
+        return int(s)
+    except ValueError:
+        return None
 
 
 def _extract_items(payload: Any) -> List[Dict[str, Any]]:
     """
-    Chuẩn hoá payload về list[dict] cho Facade:
-    - Server có thể trả: list[...] hoặc { items:[...] } hoặc { pageItems:[...] }.
-    - Trường hợp khác -> trả list rỗng.
+    Chuẩn hoá payload JSON về list[dict].
+
+    Backend có thể trả:
+      - trực tiếp list[dict]
+      - hoặc dict với key "items" / "pageItems" / "data" / "rows"
     """
     if isinstance(payload, list):
         return list(payload)
     if isinstance(payload, dict):
-        if isinstance(payload.get("pageItems"), list):
-            return list(payload["pageItems"])
-        if isinstance(payload.get("items"), list):
-            return list(payload["items"])
+        for key in ("items", "pageItems", "data", "rows"):
+            v = payload.get(key)
+            if isinstance(v, list):
+                return list(v)
     return []
 
 
-# -----------------------------------------------------------------------------
-# Core class
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Core pager
+# ---------------------------------------------------------------------------
+
+
 class HeaderPager:
     """
-    Trình phân trang tuần tự theo header Cyclos/Wallet.
+    Trình phân trang chuẩn Cyclos dựa trên header.
 
-    Thiết kế:
-      - Lấy trang hiện tại -> yield items.
-      - Ở trang đầu, cố gắng suy ra tổng số trang:
-        + Ưu tiên X-Page-Count; nếu không có, dùng X-Total-Count / page_size.
-      - Nếu biết tổng trang -> đi đến trang cuối theo kế hoạch (0..last).
-      - Nếu KHÔNG biết tổng trang -> dựa vào X-Has-Next-Page.
-        + Nếu header này không đáng tin, fallback kích thước batch: len(items) < page_size -> trang cuối.
-      - Khi server trả 400/404/422 ở trang tiếp theo -> dừng êm (không raise).
+    Tham số:
+        http_client : instance HttpClient (hoặc object tương đương) có .get()
+        endpoint    : path API, ví dụ "/api/transfers"
+        params      : dict params gốc (có thể chứa "page" và "pageSize")
+        headers     : headers mặc định đã build (Access-Client-Token, UA,...)
+        page_size   : pageSize mong muốn. Nếu None -> dùng params["pageSize"]
+        page_param  : tên param số trang, mặc định "page" (0-based)
+
+    Giao ước:
+        - Mỗi lần gọi fetch_all() sẽ:
+            1) Bắt đầu từ page = params.get(page_param, 0) (0-based)
+            2) Gọi GET tuần tự các trang
+            3) Yield từng batch (list[dict]) cho tới khi hết trang.
     """
 
     def __init__(
         self,
-        http_client: Any,                 # Đối tượng HttpClient (Module 3)
-        endpoint: str,                    # Ví dụ: "/api/users"
+        http_client: Any,
+        endpoint: str,
+        params: Mapping[str, Any],
+        headers: Mapping[str, str],
+        page_size: Optional[int] = None,
         *,
-        params: Optional[Dict[str, Any]] = None,   # params gốc (không ép page/pageSize ở đây)
-        headers: Optional[Dict[str, str]] = None,  # headers gốc (Authorization, UA, ...)
-        page_size: Optional[int] = None,           # nếu None sẽ dùng mặc định 10000
+        page_param: str = "page",
     ) -> None:
         self.http_client = http_client
         self.endpoint = endpoint
-        self.params: Dict[str, Any] = dict(params or {})
-        self.headers: Dict[str, str] = dict(headers or {})
-        # đảm bảo page_size hợp lệ, tránh 0/âm
-        ps = int(page_size or 10000)
-        self.page_size: int = ps if ps >= 1 else 10000
+        self.params: Dict[str, Any] = dict(params)
+        self.headers: Dict[str, str] = dict(headers)
+        self.page_param = page_param
 
-    # -------------------------------------------------------------------------
-    # API chính: stream từng "batch" (list[dict]) theo thứ tự page tăng dần.
-    # -------------------------------------------------------------------------
+        # Nếu truyền page_size -> ưu tiên; nếu không -> lấy từ params nếu có
+        explicit = page_size
+        if explicit is not None and explicit > 0:
+            self.page_size = explicit
+        else:
+            ps = self.params.get("pageSize")
+            self.page_size = int(ps) if isinstance(ps, int) and ps > 0 else None
+
+    # ------------------------------------------------------------------
     def fetch_all(self) -> Iterable[List[Dict[str, Any]]]:
         """
         Yield lần lượt các batch (list[dict]) cho từng trang.
-        Không raise cho 400/404/422 ở trang tiếp theo -> dừng êm.
+
+        Chiến lược dừng:
+          1) Nếu header X-Page-Count có giá trị > 0:
+               - Sau khi đọc 1 response, nếu page+1 >= X-Page-Count -> dừng.
+          2) Nếu không có X-Page-Count:
+               - Dùng X-Has-Next-Page (nếu có) để quyết định tiếp tục / dừng.
+          3) Fallback:
+               - Nếu biết page_size, và len(items) < page_size -> dừng.
+               - Nếu len(items) == 0 -> dừng.
+
+        Đối với lỗi 4xx/5xx:
+          - httpx.HTTPStatusError (400/404/422) trên trang > trang bắt đầu:
+                + Nếu header báo vẫn còn trang (X-Page-Count > page+1) -> raise RuntimeError
+                + Ngược lại -> coi như hết trang, dừng êm.
+          - Các lỗi khác -> propagate (raise).
         """
 
-        # Page bắt đầu: tôn trọng self.params.get("page", 0) nếu có
-        page = int(self.params.get("page", 0) or 0)
+        # Trang bắt đầu (0-based) nếu params đã set sẵn
+        start_page = _parse_int(str(self.params.get(self.page_param, "0"))) or 0
+        page = start_page
 
-        # Lưu kế hoạch trang cuối nếu suy ra được (index, 0-based)
-        last_page_idx: Optional[int] = None
+        # Ghi nhớ tổng số trang nếu backend cung cấp (X-Page-Count: 1-based)
+        known_page_count: Optional[int] = None
 
-        # Vòng lặp trang
         while True:
-            # Ghép params riêng cho lần gọi này:
-            # - Không làm bẩn self.params gốc
-            # - Ép page & pageSize rõ ràng để server hiểu đúng
-            p = dict(self.params)
-            p["page"] = page
-            p["pageSize"] = self.page_size
+            # Ghép params riêng cho lượt này (không mutate params gốc)
+            page_params: Dict[str, Any] = dict(self.params)
+            page_params[self.page_param] = page
+            if self.page_size:
+                page_params["pageSize"] = self.page_size
 
             try:
-                # Gửi request GET qua HttpClient (đã có limiter, retry, timeout...)
-                resp = self.http_client.get(self.endpoint, params=p, headers=self.headers)
-                # Nếu status 4xx/5xx -> raise để xét mã cụ thể
+                resp = self.http_client.get(
+                    self.endpoint, params=page_params, headers=self.headers
+                )
                 resp.raise_for_status()
-            except HTTPStatusError as e:
-                # Hết trang/vượt phạm vi: server có thể trả 400/404/422 cho page tiếp theo
+            except httpx.HTTPStatusError as e:  # type: ignore[reportGeneralTypeIssues]
                 code = e.response.status_code
-                if code in (400, 404, 422):
-                    break  # dừng êm
-                # Mã khác: ném tiếp cho tầng trên xử lý (timeout, 5xx sau retry, ...)
+
+                # Các lỗi 400/404/422 trên trang > start_page thường là out-of-range
+                if code in (400, 404, 422) and page > start_page:
+                    # Nếu header đã báo tổng số trang mà vẫn bị lỗi ở giữa -> coi như cấu hình sai
+                    if known_page_count is not None and page < known_page_count:
+                        raise RuntimeError(
+                            "Pagination error: server từ chối page="
+                            f"{page} với status={code} trong khi header báo "
+                            f"tổng {known_page_count} trang. "
+                            "Hãy giảm ONUSLIBS_PAGE_SIZE hoặc thu hẹp date range."
+                        ) from e
+                    # Không biết tổng trang -> coi như đã vượt giới hạn, dừng êm
+                    break
+
+                # Lỗi khác (hoặc lỗi ngay trang đầu) -> propagate cho tầng trên xử lý
                 raise
 
-            # Đọc JSON & bóc items
-            data = resp.json()
-            items = _extract_items(data)
-            # Chuẩn hoá header để dễ tra
-            headers = _lower_headers(resp.headers)
+            # Lấy header + payload
+            headers = resp.headers or {}
+            payload = resp.json()
 
-            # Ở lượt đầu tiên -> cố gắng suy ra tổng số trang để "đi theo kế hoạch"
-            if last_page_idx is None:
-                # 1) Ưu tiên X-Page-Count (tổng số trang 1-based)
-                page_count = (headers.get("x-page-count") or "").strip()
-                if page_count.isdigit():
-                    # last index = page_count - 1 (0-based)
-                    last_page_idx = max(0, int(page_count) - 1)
-                else:
-                    # 2) Thử X-Total-Count nếu không có X-Page-Count
-                    total_count = (headers.get("x-total-count") or "").strip()
-                    if total_count.isdigit() and self.page_size > 0:
-                        total = int(total_count)
-                        # ceil(total/page_size) - 1 -> last index (0-based); total=0 -> 0
-                        last_page_idx = max(0, ceil(total / self.page_size) - 1) if total > 0 else 0
-                # Nếu cả hai header không có/không hợp lệ -> last_page_idx vẫn None -> fallback phía dưới
+            items = _extract_items(payload)
+            if not items and page == start_page:
+                # Trang đầu tiên rỗng -> không có dữ liệu -> dừng luôn
+                break
 
-            # Yield batch hiện tại cho Facade (unified.fetch_json)
+            # Chuẩn hoá header số / bool
+            total_count = _parse_int(
+                headers.get("X-Total-Count") or headers.get("x-total-count")
+            )
+            page_size_hdr = _parse_int(
+                headers.get("X-Page-Size") or headers.get("x-page-size")
+            )
+            current_page_hdr = _parse_int(
+                headers.get("X-Current-Page") or headers.get("x-current-page")
+            )
+            if known_page_count is None:
+                known_page_count = _parse_int(
+                    headers.get("X-Page-Count") or headers.get("x-page-count")
+                )
+            has_next = _normalize_bool(
+                headers.get("X-Has-Next-Page") or headers.get("x-has-next-page")
+            )
+
+            # (total_count, current_page_hdr) hiện chưa dùng, nhưng giữ lại để mở rộng / debug
+            _ = total_count, current_page_hdr  # tránh cảnh báo "unused"
+
+            # Yield batch hiện tại cho caller
             yield items
 
-            # Nếu đã biết trang cuối -> dừng khi chạm tới
-            if last_page_idx is not None:
-                if page >= last_page_idx:
-                    break
-            else:
-                # Fallback 1: dựa header X-Has-Next-Page (true/false)
-                has_next = (headers.get("x-has-next-page") or "").lower() == "true"
-                if not has_next:
-                    # Fallback 2: nếu has_next không đáng tin -> dùng kích thước batch
-                    # - Nếu items < page_size => coi như trang cuối
-                    if len(items) < self.page_size:
-                        break
-                    # - Nếu len(items) == page_size mà has_next=false: vẫn "thử" thêm 1 trang
-                    #   vòng sau gặp 400/404/422 -> dừng êm (tránh dừng sớm)
-                    #   hoặc gặp batch nhỏ hơn -> dừng
-                    # => Không break ở đây để "thử thêm" 1 vòng
+            # ---- Quyết định dừng / tiếp tục ----
 
-            # Tăng page để lấy trang kế tiếp
+            # Ưu tiên 1: nếu biết tổng số trang (1-based)
+            if known_page_count is not None:
+                # page là 0-based, nên nếu page+1 >= known_page_count -> đã ở trang cuối
+                if page + 1 >= known_page_count:
+                    break
+                page += 1
+                continue
+
+            # Ưu tiên 2: dựa trên has_next từ header
+            if has_next is False:
+                break
+            if has_next is True:
+                page += 1
+                continue
+
+            # Ưu tiên 3: fallback theo kích thước batch
+            effective_page_size = self.page_size or page_size_hdr
+            if effective_page_size is not None and effective_page_size > 0:
+                if len(items) < effective_page_size:
+                    # Batch nhỏ hơn page_size -> trang cuối
+                    break
+                # Nếu len == page_size -> thử trang kế tiếp
+                page += 1
+                continue
+
+            # Nếu đến đây mà không có thông tin gì về page_count / has_next / page_size:
+            # - Nếu batch rỗng -> dừng
+            # - Nếu không -> vẫn thử trang kế để tránh miss dữ liệu
+            if not items:
+                break
             page += 1
 
 
-# -----------------------------------------------------------------------------
-# Facade-friendly wrapper
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Hàm tiện ích: dùng như pager function truyền vào unified.fetch_json
+# ---------------------------------------------------------------------------
+
 def header_fetch_all(
     http_client: Any,
     endpoint: str,
@@ -170,16 +255,20 @@ def header_fetch_all(
     params: Optional[Dict[str, Any]] = None,
     headers: Optional[Dict[str, str]] = None,
     page_size: Optional[int] = None,
+    page_param: str = "page",
 ) -> Iterable[List[Dict[str, Any]]]:
     """
-    Hàm trợ giúp để unified.api.fetch_json(...) có thể tiêm 'pager_func' tuỳ ý.
-    Trả về generator yield từng batch (list[dict]) theo thứ tự page tăng dần.
+    Hàm tiện ích tạo HeaderPager và yield các batch.
+
+    Dùng khi muốn tiêm 1 hàm pager vào unified.fetch_json (pager_func=...)
+    hoặc khi muốn dùng trực tiếp thay vì khởi tạo class bằng tay.
     """
     pager = HeaderPager(
         http_client=http_client,
         endpoint=endpoint,
-        params=params,
-        headers=headers,
+        params=params or {},
+        headers=headers or {},
         page_size=page_size,
+        page_param=page_param,
     )
     return pager.fetch_all()
