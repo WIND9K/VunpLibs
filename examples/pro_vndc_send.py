@@ -121,6 +121,7 @@ def main(argv: List[str]) -> int:
         unique_key="transactionNumber",
         # strict_fields=True,   # DEV/TEST nếu muốn canh schema
         # on_batch=...         # nếu muốn stream về DB
+        parallel=True,
     )
 
     total = len(rows)
