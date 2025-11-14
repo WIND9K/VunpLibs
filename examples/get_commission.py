@@ -3,9 +3,9 @@
 Fetch commission history (VNDC) qua OnusLibs Facade – cấu hình tách ở đầu trang.
 
 Chạy mẫu:
-  python -m examples.fetch_commission_history --date 2025-10-11
-  python -m examples.fetch_commission_history --start-date 2025-10-11 --end-date 2025-10-11 --preset basic
-  python -m examples.fetch_commission_history --date 2025-10-11 --fields date,amount,description
+  python -m examples.get_commission  --date 2025-10-11
+  python -m examples.get_commission  --start-date 2025-10-11 --end-date 2025-10-11 --preset basic
+  python -m examples.get_commission  --date 2025-10-11 --fields date,amount,description
 """
 
 from __future__ import annotations
@@ -27,7 +27,7 @@ PRESETS: Dict[str, List[str]] = {
 }
 
 # Mặc định params
-DEFAULT_PAGE_SIZE     = 1000
+DEFAULT_PAGE_SIZE     = None
 DEFAULT_ORDER         = "dateAsc"  # hoặc "dateDesc"
 DEFAULT_FILTER        = "vndc_commission_acc.commission_buysell"
 DEFAULT_CHARGED_BACK  = "false"    # "true"/"false"
@@ -86,7 +86,7 @@ def build_params(
     charged_back: str = DEFAULT_CHARGED_BACK,
     transfer_filters: str = DEFAULT_FILTER,
     order: str = DEFAULT_ORDER,
-    page: int = 0,
+    # page: int = 0,
 ) -> Dict[str, str]:
     """
     Trả dict params gọn để đưa thẳng vào fetch_json.
@@ -105,7 +105,7 @@ def build_params(
         "transferFilters": transfer_filters,
         "datePeriod":      dp,
         "orderBy":         order,
-        "page":            str(page),  # an toàn
+        # KHÔNG set "page" – để HeaderPager tự xử lý
     }
 
 def _parse_int(v) -> Optional[int]:
@@ -193,7 +193,7 @@ def main(argv: List[str]) -> int:
         charged_back=args.charged_back,
         transfer_filters=args.filters,
         order=args.order,
-        page=0,
+        # page=0,
     )
 
     # 3) Fetch
@@ -210,16 +210,24 @@ def main(argv: List[str]) -> int:
     )
 
     # 4) Xuất & thống kê
-    if args.out_json:
-        print_json(rows, to_file=args.out_json)
-        print(f"Đã ghi JSON: {len(rows)} dòng -> {args.out_json}")
-    else:
-        print_json(rows)
-        print(f"\nTotal fetched rows: {len(rows)}")
+    # if args.out_json:
+    #     print_json(rows, to_file=args.out_json)
+    #     print(f"Đã ghi JSON: {len(rows)} dòng -> {args.out_json}")
+    # else:
+    #     print_json(rows)
+    #     print(f"\nTotal fetched rows: {len(rows)}")
+    from tools.print_json import print_json
+    print_json(len(rows))
 
     api_total = try_get_api_total_count(s, ENDPOINT, params)
     if api_total is not None:
         print(f"API reported X-Total-Count: {api_total}")
+
+    from tools.write_csv import write_csv
+
+    out = "files/commission_history.csv"
+    n = write_csv(rows, out)  # auto dò cột, tự flatten nested dict
+    print(f"Đã ghi {n} dòng vào {out}")
 
     return 0
 

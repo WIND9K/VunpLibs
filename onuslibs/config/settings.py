@@ -96,6 +96,8 @@ class OnusSettings:
     page_size: int | None = None  # <- default từ ENV; app không cần truyền
     req_per_sec: float | None = None
     max_inflight: int | None = None
+    # NEW: bật/tắt phân trang song song (HeaderPager parallel) qua ENV
+    pager_parallel: bool | None = None
     timeout_s: float | None = None
     http2: bool | None = None
 
@@ -132,6 +134,13 @@ class OnusSettings:
         self.page_size = self.page_size or _i("ONUSLIBS_PAGE_SIZE", 20000)  # ENV-first
         self.req_per_sec = self.req_per_sec or _f("ONUSLIBS_REQ_PER_SEC", 2.0)
         self.max_inflight = self.max_inflight or _i("ONUSLIBS_MAX_INFLIGHT", 4)
+
+        # NEW: bật/tắt parallel pager từ ENV (song song trong 1 window)
+        self.pager_parallel = _b(
+            "ONUSLIBS_PARALLEL",
+            True if self.pager_parallel is None else bool(self.pager_parallel),
+        )
+
         self.timeout_s = self.timeout_s or _f("ONUSLIBS_TIMEOUT_S", 60.0)
 
         # NEW: số giờ tối đa cho mỗi segment datePeriod
@@ -154,7 +163,9 @@ class OnusSettings:
             if self.segment_max_workers is not None
             else _i("ONUSLIBS_SEGMENT_MAX_WORKERS", 0)
         )
-        self.segment_max_workers = raw_workers if isinstance(raw_workers, int) and raw_workers > 0 else None
+        self.segment_max_workers = (
+            raw_workers if isinstance(raw_workers, int) and raw_workers > 0 else None
+        )
 
         # http2 mặc định True; cho phép override bằng ENV
         self.http2 = True if self.http2 is None else bool(self.http2)
@@ -234,6 +245,7 @@ class OnusSettings:
             "page_size": self.page_size,
             "req_per_sec": self.req_per_sec,
             "max_inflight": self.max_inflight,
+            "pager_parallel": self.pager_parallel,
             "timeout_s": self.timeout_s,
             "http2": self.http2,
             "date_segment_hours": self.date_segment_hours,

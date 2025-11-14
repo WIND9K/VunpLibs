@@ -127,6 +127,12 @@ def main(argv: List[str]) -> int:
         # print("Sample row[0]:")
         # print(rows[0])
 
+    from tools.write_csv import write_csv
+
+    out = "files/commission_history.csv"
+    n = write_csv(rows, out)  # auto dò cột, tự flatten nested dict
+    print(f"Đã ghi {n} dòng vào {out}")
+
     return 0
 
 
