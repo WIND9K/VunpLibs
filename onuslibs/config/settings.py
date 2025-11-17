@@ -101,9 +101,20 @@ class OnusSettings:
     timeout_s: float | None = None
     http2: bool | None = None
 
-    # NEW: chia nhỏ datePeriod theo ENV (giờ)
+    # NEW: chia nhỏ datePeriod theo ENV (giờ) - chế độ manual / legacy
     # 0 hoặc None => không segment, dùng 1 datePeriod như cũ
     date_segment_hours: int | None = None
+
+    # NEW: auto-segment dựa trên tổng số record thực tế
+    # True  => lib sẽ tự peek tổng record, tự quyết định có cần cắt nhỏ datePeriod hay không
+    # False => giữ behaviour cũ, chỉ dựa vào date_segment_hours (nếu > 0)
+    auto_segment: bool | None = None
+
+    # Ngưỡng tối đa số record cho 1 "cửa sổ thời gian" trước khi cần segment
+    max_rows_per_window: int | None = None
+
+    # Số lần tối đa được phép chia đôi 1 segment khi vẫn gặp lỗi 422
+    max_segment_split_depth: int | None = None
 
     # NEW: điều khiển chạy song song giữa các segment datePeriod
     # True  => cho phép đa luồng (ThreadPoolExecutor) trên segment
@@ -143,12 +154,32 @@ class OnusSettings:
 
         self.timeout_s = self.timeout_s or _f("ONUSLIBS_TIMEOUT_S", 60.0)
 
-        # NEW: số giờ tối đa cho mỗi segment datePeriod
+        # NEW: số giờ tối đa cho mỗi segment datePeriod (manual / legacy)
         # 0 => tắt segment, dùng nguyên khoảng datePeriod
         self.date_segment_hours = (
             self.date_segment_hours
             if self.date_segment_hours is not None
             else _i("ONUSLIBS_DATE_SEGMENT_HOURS", 0)
+        )
+
+        # NEW: auto-segment: cho phép lib tự quyết định việc cắt nhỏ datePeriod
+        self.auto_segment = _b(
+            "ONUSLIBS_AUTO_SEGMENT",
+            True if self.auto_segment is None else bool(self.auto_segment),
+        )
+
+        # Ngưỡng tối đa số record cho 1 cửa sổ thời gian
+        self.max_rows_per_window = (
+            self.max_rows_per_window
+            if self.max_rows_per_window is not None
+            else _i("ONUSLIBS_MAX_ROWS_PER_WINDOW", 8000)
+        )
+
+        # Số lần tối đa được phép chia đôi 1 segment khi vẫn gặp lỗi 422
+        self.max_segment_split_depth = (
+            self.max_segment_split_depth
+            if self.max_segment_split_depth is not None
+            else _i("ONUSLIBS_MAX_SEGMENT_SPLIT_DEPTH", 4)
         )
 
         # NEW: điều khiển segment song song
@@ -239,6 +270,18 @@ class OnusSettings:
         if self.segment_max_workers is not None and self.segment_max_workers < 1:
             raise ConfigError("ONUSLIBS_SEGMENT_MAX_WORKERS must be >= 1 if set")
 
+        # NEW: validate optional auto-segment params
+        if self.max_rows_per_window is not None and self.max_rows_per_window <= 0:
+            raise ConfigError("ONUSLIBS_MAX_ROWS_PER_WINDOW must be > 0 if set")
+
+        if (
+            self.max_segment_split_depth is not None
+            and self.max_segment_split_depth < 0
+        ):
+            raise ConfigError(
+                "ONUSLIBS_MAX_SEGMENT_SPLIT_DEPTH must be >= 0 if set"
+            )
+
     def to_dict(self) -> dict:
         return {
             "base_url": self.base_url,
@@ -249,6 +292,9 @@ class OnusSettings:
             "timeout_s": self.timeout_s,
             "http2": self.http2,
             "date_segment_hours": self.date_segment_hours,
+            "auto_segment": self.auto_segment,
+            "max_rows_per_window": self.max_rows_per_window,
+            "max_segment_split_depth": self.max_segment_split_depth,
             "segment_parallel": self.segment_parallel,
             "segment_max_workers": self.segment_max_workers,
             "secrets_backend": self.secrets_backend,

@@ -1,0 +1,81 @@
+# ==============================
+# OnusLibs – Cấu hình môi trường
+# ==============================
+
+# ====== BẮT BUỘC ======
+# Base URL của API ONUS (Cyclos). Thường cố định.
+ONUSLIBS_BASE_URL=https://wallet.vndc.io
+
+
+# ====== Điều khiển runtime HTTP / Pagination ======
+# Kích thước mỗi page khi phân trang (số record / request).
+# Giá trị lớn -> ít request hơn nhưng dễ chạm limit phía server nếu dữ liệu quá dày.
+# Giá trị nhỏ -> nhiều request hơn nhưng an toàn hơn.
+ONUSLIBS_PAGE_SIZE=500
+
+# Số request tối đa mỗi giây (rate limit client-side).
+# Dùng để tránh bắn quá nhiều request lên server trong 1 giây.
+ONUSLIBS_REQ_PER_SEC=2
+
+# Số request tối đa chạy song song (concurrent in-flight requests).
+# Kết hợp với REQ_PER_SEC để điều khiển mức độ “song song” khi phân trang.
+ONUSLIBS_MAX_INFLIGHT=4
+
+# Timeout (giây) cho mỗi HTTP request.
+# Nếu API chậm hơn giá trị này thì request sẽ bị hủy.
+ONUSLIBS_TIMEOUT_S=60
+
+# Bật HTTP/2 cho client (nếu hạ tầng hỗ trợ).
+# true  -> dùng HTTP/2 (nhiều stream trên 1 connection).
+# false -> dùng HTTP/1.1.
+ONUSLIBS_HTTP2=true
+
+
+# ====== Điều khiển segment theo thời gian (legacy / manual) ======
+# Số giờ mỗi segment khi chia nhỏ datePeriod.
+# 0   -> không chia theo giờ, dùng một cửa sổ datePeriod duy nhất.
+# > 0 -> cắt datePeriod thành nhiều segment có độ dài X giờ.
+# Lưu ý: khi bật auto-segment, biến này sẽ ít/không còn được dùng cho luồng mặc định.
+ONUSLIBS_DATE_SEGMENT_HOURS=4
+
+# Cho phép chạy các segment song song hay không.
+# true  -> các segment được xử lý song song (tùy cấu hình MAX_INFLIGHT/REQ_PER_SEC).
+# false -> xử lý tuần tự từng segment.
+ONUSLIBS_SEGMENT_PARALLEL=true
+
+
+# ====== Auto segment (đề xuất dùng cho production) ======
+# Bật cơ chế auto-segment dựa trên tổng số record thực tế.
+# true  -> lib sẽ peek tổng record cho 1 datePeriod, tự quyết định có cần cắt nhỏ theo thời gian hay không.
+# false -> giữ behaviour cũ, chỉ dựa vào ONUSLIBS_DATE_SEGMENT_HOURS nếu > 0.
+ONUSLIBS_AUTO_SEGMENT=true
+
+# Ngưỡng tối đa số record cho 1 “cửa sổ thời gian” (1 datePeriod) trước khi lib quyết định phải segment.
+# Ví dụ: nếu tổng record cho 1 datePeriod > 8000 thì lib sẽ tự động chia nhỏ datePeriod thành nhiều đoạn.
+# Giá trị gợi ý: 8000–10000 tùy endpoint và mức an toàn mong muốn.
+ONUSLIBS_MAX_ROWS_PER_WINDOW=8000
+
+# Số lần tối đa được phép “chia đôi” một segment khi vẫn gặp lỗi 422 từ server.
+# Nếu đạt tới depth này mà server vẫn trả 422, lib sẽ log cảnh báo rõ ràng và raise lỗi.
+# Giá trị gợi ý: 3–5. Giá trị quá lớn sẽ làm tăng số request không cần thiết.
+ONUSLIBS_MAX_SEGMENT_SPLIT_DEPTH=4
+
+
+# ====== Secrets backend (API token & DB secrets) ======
+# Backend lưu trữ secrets:
+# - keyring: dùng OS keyring (gợi ý cho production / dev cá nhân).
+# - env    : lấy trực tiếp từ biến môi trường (không nên log ra).
+ONUSLIBS_SECRETS_BACKEND=keyring
+
+# Tên service sử dụng cho Keyring (namespace cho các key).
+# Ví dụ: DB_HOST, DB_USER, ACCESS_CLIENT_TOKEN sẽ được lưu dưới service này.
+ONUSLIBS_KEYRING_SERVICE=OnusLibs
+
+# Item (key) mặc định dùng để lấy token API từ Keyring.
+# Thông thường: ACCESS_CLIENT_TOKEN.
+ONUSLIBS_KEYRING_ITEM=ACCESS_CLIENT_TOKEN
+
+# Điều khiển thứ tự ưu tiên giữa ENV và Keyring.
+# false -> ưu tiên Keyring trước, ENV chỉ là fallback.
+# true  -> ưu tiên ENV trước, nếu không có mới đọc Keyring.
+ONUSLIBS_FALLBACK_ENV=false
