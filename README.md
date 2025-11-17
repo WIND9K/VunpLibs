@@ -130,6 +130,9 @@ Module DB của OnusLibs được thiết kế để:
   - Query (SELECT),
   - Execute (INSERT/UPDATE/DELETE),
   - Bulk insert.
+- Hỗ trợ **2 kiểu dùng**:
+  - Dùng nhanh qua **facade hàm**: `from onuslibs.db import query, execute, ...`
+  - Dùng nâng cao qua **class `DB`**: `DB(DbSettings.from_secure())`.
 
 > Mục tiêu: ETL mini / báo cáo (như OnusReport) có thể dùng OnusLibs cho cả **API** và **DB** mà không tự xử lý secret.
 
@@ -153,6 +156,17 @@ python -c "import keyring; s='$svc'; keyring.set_password(s,'DB_SSL_CA','')"  # 
 - `ONUSLIBS_KEYRING_SERVICE` và `ONUSLIBS_KEYRING_ITEM` dùng cho token API,  
   còn DB đọc từ các key riêng (`DB_HOST`, `DB_USER`, …) trong cùng service.
 - Có thể **bật fallback ENV** bằng `ONUSLIBS_FALLBACK_ENV=true` để ưu tiên ENV trước khi tra keyring.
+- Ngoài ra có thể cấu hình DB qua ENV, ví dụ trong `.env`:
+
+```env
+ONUSLIBS_DB_HOST=127.0.0.1
+ONUSLIBS_DB_PORT=3306
+ONUSLIBS_DB_USER=onusreport
+ONUSLIBS_DB_PASSWORD=xxx
+ONUSLIBS_DB_NAME=onusreport
+ONUSLIBS_DB_SSL_CA=
+ONUSLIBS_DB_CONNECT_TIMEOUT=10
+```
 
 ## 2. DbSettings.from_secure
 
@@ -188,7 +202,67 @@ Object `DbSettings` cung cấp thêm:
 db_settings.safe_dict()  # Trả về dict cấu hình để log/debug, KHÔNG chứa password
 ```
 
-## 3. API DB: DB.healthcheck, DB.query, DB.execute, DB.bulk_insert
+## 3. Dùng nhanh: facade `onuslibs.db` (khuyến nghị cho app/ETL)
+
+Module `onuslibs.db` export sẵn các hàm:
+
+- `healthcheck()` – kiểm tra DB bằng SELECT 1.
+- `query(sql, params=None)` – chạy SELECT, trả list[dict].
+- `execute(sql, params=None)` – chạy INSERT/UPDATE/DELETE 1 câu lệnh.
+- `bulk_insert(sql, rows, batch_size=1000)` – insert nhiều dòng hiệu quả.
+- và class `DbSettings` nếu cần dùng cấu hình tuỳ chỉnh.
+
+Cách dùng đơn giản nhất:
+
+```python
+from onuslibs.db import DbSettings, healthcheck, query, execute, bulk_insert
+
+# 1) Kiểm tra kết nối
+print("DB OK?", healthcheck())
+
+# 2) SELECT vài dòng từ onchain_diary
+rows = query("SELECT * FROM onchain_diary LIMIT %s", (5,))
+for r in rows:
+    print(r)
+
+# 3) INSERT 1 record vào bảng tmp_onuslibs_smoke
+execute(
+    "INSERT INTO tmp_onuslibs_smoke(id, name, score) VALUES (%s,%s,%s)",
+    (123, "smoke test", 100),
+)
+
+# 4) BULK INSERT nhiều dòng
+rows_to_insert = [
+    (2001, "bulk-1", 10),
+    (2002, "bulk-2", 20),
+]
+bulk_insert(
+    "INSERT INTO tmp_onuslibs_smoke(id, name, score) VALUES (%s,%s,%s)",
+    rows_to_insert,
+    batch_size=1000,
+)
+```
+
+Hành vi:
+
+- Lần đầu gọi `healthcheck/query/execute/bulk_insert` mà **không truyền `settings`**, OnusLibs sẽ:
+  - Tự gọi `DbSettings.from_secure()` để lấy cấu hình DB,
+  - Tạo một instance `DB` nội bộ và cache lại.
+- Các lần gọi sau reuse lại `DB` đó → đỡ phải đọc config/keyring nhiều lần.
+- Nếu muốn dùng cấu hình DB khác cho 1 call cụ thể, có thể truyền `settings`:
+
+```python
+custom_settings = DbSettings(
+    host="127.0.0.1",
+    user="root",
+    password="xxx",
+    name="test_db",
+)
+
+rows = query("SELECT 1", settings=custom_settings)
+```
+
+## 4. Dùng nâng cao: class `DB` (cần kiểm soát nhiều hơn)
 
 Module core DB nằm tại `onuslibs.db.core` với lớp `DB`:
 
@@ -230,7 +304,7 @@ Giải thích nhanh:
 - `DB.healthcheck()`:
   - Mở kết nối, chạy `SELECT 1`, trả về `True/False` (không raise nếu lỗi).
 - `DB.query(sql, params)`:
-  - Mở kết nối, chạy SELECT, trả list[dict] (nếu dùng `DictCursor`), hoặc chuyển tuple → dict.
+  - Mở kết nối, chạy SELECT, trả list[dict] (nếu dùng `DictCursor`).
 - `DB.execute(sql, params)`:
   - Mở kết nối, chạy 1 câu lệnh write (INSERT/UPDATE/DELETE), `commit`, trả số dòng ảnh hưởng.
 - `DB.bulk_insert(sql, rows, batch_size=1000)`:
@@ -241,7 +315,7 @@ Giải thích nhanh:
 
 > Lưu ý: mọi hàm đều **tự mở/đóng connection**, phù hợp cho script ETL, không cần tự quản lý pool.
 
-## 4. Gợi ý mở rộng: decorator `@transactional` (tương lai)
+## 5. Gợi ý mở rộng: decorator `@transactional` (tương lai)
 
 Hiện tại module DB **chưa triển khai** decorator `@transactional`, nhưng README giữ lại phần này như định hướng kiến trúc:
 
