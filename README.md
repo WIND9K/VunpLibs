@@ -124,13 +124,12 @@ date_period = build_date_period("2025-10-11", "2025-10-11")
 Module DB của OnusLibs được thiết kế để:
 
 - **Dùng chung cơ chế bảo mật** với API:
-  - DB password, host, user… lấy từ **Keyring** (cùng service `OnusLibs`).
+  - DB password, host, user… lấy từ **Keyring** (cùng service `OnusLibs`) hoặc ENV.
 - Cung cấp API đơn giản, đủ dùng cho:
   - Healthcheck,
   - Query (SELECT),
   - Execute (INSERT/UPDATE/DELETE),
-  - Bulk insert,
-  - Transaction với decorator `@transactional`.
+  - Bulk insert.
 
 > Mục tiêu: ETL mini / báo cáo (như OnusReport) có thể dùng OnusLibs cho cả **API** và **DB** mà không tự xử lý secret.
 
@@ -152,86 +151,119 @@ python -c "import keyring; s='$svc'; keyring.set_password(s,'DB_SSL_CA','')"  # 
 ```
 
 - `ONUSLIBS_KEYRING_SERVICE` và `ONUSLIBS_KEYRING_ITEM` dùng cho token API,  
-  còn DB có thể dùng key riêng (`DB_HOST`, `DB_USER`, …) trong cùng service.
+  còn DB đọc từ các key riêng (`DB_HOST`, `DB_USER`, …) trong cùng service.
+- Có thể **bật fallback ENV** bằng `ONUSLIBS_FALLBACK_ENV=true` để ưu tiên ENV trước khi tra keyring.
 
 ## 2. DbSettings.from_secure
 
-Trong module DB (ví dụ `onuslibs.db.settings`):
+Lớp cấu hình DB nằm trong `onuslibs.db.settings`:
 
 ```python
-from onuslibs.db import DbSettings
+from onuslibs.db.settings import DbSettings
 
-db_settings = DbSettings.from_secure(
-    service="OnusLibs",   # trùng ONUSLIBS_KEYRING_SERVICE
-    host_key="DB_HOST",
-    port_key="DB_PORT",
-    user_key="DB_USER",
-    password_key="DB_PASSWORD",
-    name_key="DB_NAME",
-    ssl_ca_key="DB_SSL_CA",    # optional
+# Đa số trường hợp chỉ cần gọi trống:
+db_settings = DbSettings.from_secure()
+
+# Hoặc ép fallback ENV trước, rồi mới tới keyring:
+db_settings = DbSettings.from_secure(fallback_env=True)
+```
+
+- `service`:
+  - Nếu không truyền → lấy từ `OnusSettings.keyring_service` hoặc ENV `ONUSLIBS_KEYRING_SERVICE` (mặc định `"OnusLibs"`).
+- `fallback_env`:
+  - Nếu `True` → ưu tiên đọc ENV trước, sau đó mới tra Keyring.
+  - Nếu `False` (hoặc không set, mà `OnusSettings.fall_back_env` là false) → đọc Keyring trước, ENV là dự phòng.
+- Bên trong, `DbSettings.from_secure` sẽ đọc lần lượt:
+  - `ONUSLIBS_DB_HOST` hoặc Keyring `"DB_HOST"`,
+  - `ONUSLIBS_DB_USER` hoặc Keyring `"DB_USER"`,
+  - `ONUSLIBS_DB_PASSWORD` hoặc Keyring `"DB_PASSWORD"`,
+  - `ONUSLIBS_DB_NAME` hoặc Keyring `"DB_NAME"`,
+  - `ONUSLIBS_DB_PORT` hoặc Keyring `"DB_PORT"` (mặc định `3306`),
+  - `ONUSLIBS_DB_SSL_CA` hoặc Keyring `"DB_SSL_CA"` (nếu dùng SSL),
+  - `ONUSLIBS_DB_CONNECT_TIMEOUT` hoặc Keyring `"DB_CONNECT_TIMEOUT"` (mặc định `10` giây).
+
+Object `DbSettings` cung cấp thêm:
+
+```python
+db_settings.safe_dict()  # Trả về dict cấu hình để log/debug, KHÔNG chứa password
+```
+
+## 3. API DB: DB.healthcheck, DB.query, DB.execute, DB.bulk_insert
+
+Module core DB nằm tại `onuslibs.db.core` với lớp `DB`:
+
+```python
+from onuslibs.db.settings import DbSettings
+from onuslibs.db.core import DB
+
+# 1) Lấy cấu hình DB từ keyring + ENV
+db_settings = DbSettings.from_secure()
+
+# 2) Tạo instance DB
+db = DB(settings=db_settings)
+
+# 3) Healthcheck
+ok = db.healthcheck()
+if not ok:
+    raise SystemExit("DB healthcheck failed")
+
+# 4) Query (SELECT)
+rows = db.query("SELECT * FROM onchain_diary WHERE userid = %s LIMIT 10", (123,))
+
+# 5) Execute (INSERT/UPDATE/DELETE 1 câu lệnh)
+affected = db.execute(
+    "UPDATE tmp_onuslibs_smoke SET score = %s WHERE id = %s",
+    (100, 1),
 )
-```
 
-- `DbSettings.from_secure`:
-  - Đọc các key tương ứng trong Keyring (theo service).
-  - Trả về object DbSettings chứa thông tin kết nối DB.
-
-## 3. API DB: healthcheck, query, execute, bulk_insert
-
-Tùy cách bạn tổ chức module, pattern khuyến nghị:
-
-```python
-from onuslibs.db import connect, healthcheck, query, execute, bulk_insert
-
-# 1) Kết nối
-conn = connect(db_settings)
-
-# 2) Healthcheck
-healthcheck(conn)  # raise hoặc trả True/False tùy implementation
-
-# 3) Query (SELECT)
-rows = query(conn, "SELECT * FROM my_table WHERE id = %s", (123,))
-
-# 4) Execute (INSERT/UPDATE/DELETE)
-execute(conn, "UPDATE my_table SET status = %s WHERE id = %s", ("OK", 123))
-
-# 5) Bulk insert
+# 6) Bulk insert (INSERT nhiều dòng hiệu quả)
 rows_to_insert = [
-    {"id": 1, "name": "Alice"},
-    {"id": 2, "name": "Bob"},
+    (1, "Alice", 90),
+    (2, "Bob", 85),
 ]
-bulk_insert(conn, table="users", rows=rows_to_insert, columns=["id", "name"])
+sql_insert = "INSERT INTO tmp_onuslibs_smoke (id, name, score) VALUES (%s, %s, %s)"
+total_inserted = db.bulk_insert(sql_insert, rows_to_insert, batch_size=1000)
 ```
 
-- `query` trả về list dict (nếu có mapping), hoặc tuple rows tuỳ cách bạn implement.
-- `bulk_insert` nên dùng `executemany` / batch để tối ưu.
+Giải thích nhanh:
 
-## 4. Decorator `@transactional`
+- `DB.healthcheck()`:
+  - Mở kết nối, chạy `SELECT 1`, trả về `True/False` (không raise nếu lỗi).
+- `DB.query(sql, params)`:
+  - Mở kết nối, chạy SELECT, trả list[dict] (nếu dùng `DictCursor`), hoặc chuyển tuple → dict.
+- `DB.execute(sql, params)`:
+  - Mở kết nối, chạy 1 câu lệnh write (INSERT/UPDATE/DELETE), `commit`, trả số dòng ảnh hưởng.
+- `DB.bulk_insert(sql, rows, batch_size=1000)`:
+  - Dùng `executemany` theo batch để insert nhanh,
+  - `rows` là iterable các tuple giá trị,
+  - `sql` là câu INSERT với placeholder `%s`,
+  - Trả tổng số dòng đã insert.
 
-Cho phép bạn bọc logic trong 1 transaction:
+> Lưu ý: mọi hàm đều **tự mở/đóng connection**, phù hợp cho script ETL, không cần tự quản lý pool.
+
+## 4. Gợi ý mở rộng: decorator `@transactional` (tương lai)
+
+Hiện tại module DB **chưa triển khai** decorator `@transactional`, nhưng README giữ lại phần này như định hướng kiến trúc:
+
+- Ý tưởng:
+  - Bọc logic business trong 1 transaction,
+  - Tự `commit` nếu không lỗi, `rollback` nếu có exception.
+- Mẫu API mong muốn trong tương lai (chưa có trong code):
 
 ```python
-from onuslibs.db import transactional, connect
+from onuslibs.db.core import DB, transactional
 
-conn = connect(db_settings)
+db = DB(DbSettings.from_secure())
 
-@transactional(conn)
+@transactional(db)
 def process_user(cur, user_id: int):
-    # cur là cursor/connection (tuỳ implement)
-    # Thực hiện nhiều câu lệnh SQL
     cur.execute("UPDATE users SET status = %s WHERE id = %s", ("ACTIVE", user_id))
     cur.execute("INSERT INTO logs(user_id, action) VALUES (%s, %s)", (user_id, "activate"))
-
-# Gọi
-process_user(123)
 ```
 
-- Nếu không có exception → commit.
-- Nếu có exception → rollback.
+Khi decorator này được bổ sung, OnusLibs sẽ hỗ trợ tốt hơn cho các pipeline ETL phức tạp cần nhiều câu lệnh SQL trong cùng 1 transaction.
 
-> Với pattern này, pipeline kiểu OnusReport (ETL mini) có thể:
-> - dùng `fetch_json` để lấy dữ liệu từ API,
-> - dùng module DB để insert/update dữ liệu vào MySQL một cách an toàn.
+---
 
 ---
 
