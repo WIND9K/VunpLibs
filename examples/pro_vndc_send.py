@@ -217,22 +217,22 @@ def main(argv: List[str]) -> int:
     total = len(rows)
     print(f"Hoàn tất, tổng số record: {total}")
 
-    # In demo vài dòng (nếu không dump JSON full)
-    limit = max(0, int(args.limit_print))
-    if not args.json and limit > 0 and total > 0:
-        print(f"\n===== {min(limit, total)} dòng đầu tiên =====")
-        for i, r in enumerate(rows[:limit], start=1):
-            print(f"[{i}] tx={r.get('transactionNumber')} date={r.get('date')} amount={r.get('amount')}")
-            print(
-                f"    from: {r.get('from', {}).get('user', {}).get('id')} - "
-                f"{r.get('from', {}).get('user', {}).get('display')}"
-            )
-            print(
-                f"    to  : {r.get('to', {}).get('user', {}).get('id')} - "
-                f"{r.get('to', {}).get('user', {}).get('display')}"
-            )
-            print(f"    type: {r.get('type', {}).get('internalName')}")
-            print("-" * 40)
+    # In demo vài dòng
+    # limit = max(0, int(args.limit_print))
+    # if limit > 0:
+    #     print(f"\n===== {min(limit, total)} dòng đầu tiên =====")
+    #     for i, r in enumerate(rows[:limit], start=1):
+    #         print(f"[{i}] tx={r.get('transactionNumber')} date={r.get('date')} amount={r.get('amount')}")
+    #         print(
+    #             f"    from: {r.get('from', {}).get('user', {}).get('id')} - "
+    #             f"{r.get('from', {}).get('user', {}).get('display')}"
+    #         )
+    #         print(
+    #             f"    to  : {r.get('to', {}).get('user', {}).get('id')} - "
+    #             f"{r.get('to', {}).get('user', {}).get('display')}"
+    #         )
+    #         print(f"    type: {r.get('type', {}).get('internalName')}")
+    #         print("-" * 40)
 
     # Dump full JSON nếu cần
     if args.json:
