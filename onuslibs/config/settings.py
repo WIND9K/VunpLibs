@@ -101,9 +101,14 @@ class OnusSettings:
     timeout_s: float | None = None
     http2: bool | None = None
 
-    # NEW: chia nhỏ datePeriod theo ENV (giờ) - chế độ manual / legacy
-    # 0 hoặc None => không segment, dùng 1 datePeriod như cũ
+    # NEW: chia datePeriod lớn thành các window theo số ngày
+    # 0 hoặc None => không chia theo ngày, dùng nguyên khoảng datePeriod
+    max_window_days: int | None = None
+
+    # Legacy: chia nhỏ datePeriod theo ENV (giờ) - chế độ manual cũ
+    # 0 hoặc None => không segment theo giờ
     date_segment_hours: int | None = None
+
 
     # NEW: auto-segment dựa trên tổng số record thực tế
     # True  => lib sẽ tự peek tổng record, tự quyết định có cần cắt nhỏ datePeriod hay không
@@ -153,6 +158,13 @@ class OnusSettings:
         )
 
         self.timeout_s = self.timeout_s or _f("ONUSLIBS_TIMEOUT_S", 60.0)
+
+        # NEW: chia datePeriod thành các "cửa sổ ngày" dài tối đa N ngày
+        self.max_window_days = (
+            self.max_window_days
+            if self.max_window_days is not None
+            else _i("ONUSLIBS_MAX_WINDOW_DAYS", 0)
+        )
 
         # NEW: số giờ tối đa cho mỗi segment datePeriod (manual / legacy)
         # 0 => tắt segment, dùng nguyên khoảng datePeriod
@@ -265,6 +277,10 @@ class OnusSettings:
         # NEW: kiểm tra date_segment_hours >= 0
         if not isinstance(self.date_segment_hours, int) or self.date_segment_hours < 0:
             raise ConfigError("ONUSLIBS_DATE_SEGMENT_HOURS must be >= 0")
+        
+        # NEW: kiểm tra max_window_days >= 0
+        if self.max_window_days is not None and self.max_window_days < 0:
+            raise ConfigError("ONUSLIBS_MAX_WINDOW_DAYS must be >= 0 if set")
 
         # NEW: nếu segment_max_workers có set thì phải >=1 (thực tế đã normalize, đây là chặn double)
         if self.segment_max_workers is not None and self.segment_max_workers < 1:
@@ -306,6 +322,7 @@ class OnusSettings:
             "user_agent": self.user_agent,
             "proxy": self.proxy,
             "verify_ssl": self.verify_ssl,
+            "max_window_days": self.max_window_days,
         }
 
 

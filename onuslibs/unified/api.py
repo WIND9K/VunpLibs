@@ -290,7 +290,6 @@ def _fetch_single_window(
 
 # ---------- Facade chính: fetch_json ----------
 
-
 def fetch_json(
     endpoint: str,
     params: Optional[Dict[str, Any]] = None,
@@ -306,38 +305,39 @@ def fetch_json(
     # DI / mở rộng
     client: Optional[HttpClient] = None,
     pager_func: Optional[
-        Callable[
-            [HttpClient, str, Dict[str, Any], Dict[str, str], int],
-            Iterable[List[Dict[str, Any]]],
-        ]
+        Callable[[HttpClient, str, Dict[str, Any], Dict[str, str], int], Iterable[List[Dict[str, Any]]]]
     ] = None,
     extra_headers: Optional[Dict[str, str]] = None,
     # Parallel: nếu None -> dùng settings.pager_parallel (ONUSLIBS_PARALLEL)
     parallel: Optional[bool] = None,
     workers: Optional[int] = None,
 ) -> List[Dict[str, Any]]:
-    """Facade GET JSON (1 cửa sổ hoặc nhiều segment theo datePeriod).
+    """Facade GET JSON với hybrid auto-segment theo datePeriod.
 
-    Hành vi tổng quát:
+    Hành vi tổng quát (v3 – hybrid):
 
     - Đọc base_url, page_size, rate-limit... từ OnusSettings (ENV).
     - Nếu **không có** `datePeriod` hoặc `paginate=False`:
         -> chỉ gọi `_fetch_single_window` 1 lần (không cắt thời gian).
     - Nếu có `datePeriod` và `paginate=True`:
-        - Luôn coi toàn bộ khoảng thời gian là 1 hoặc nhiều "segment" (tuỳ
-          `ONUSLIBS_DATE_SEGMENT_HOURS`).
-        - Nếu `ONUSLIBS_AUTO_SEGMENT=true` + xảy ra lỗi 422 do pagination:
-            -> tự động chia đôi segment theo thời gian (đến tối đa
-               `ONUSLIBS_MAX_SEGMENT_SPLIT_DEPTH` lần) và thử lại.
-        - Nếu `ONUSLIBS_AUTO_SEGMENT=false`:
-            -> chỉ cắt theo `ONUSLIBS_DATE_SEGMENT_HOURS` (nếu > 0),
-               không tự chia nhỏ thêm.
+        1) Chia khoảng thời gian lớn thành nhiều window theo
+           `ONUSLIBS_MAX_WINDOW_DAYS` (nếu > 0).
+        2) Với từng window, nếu bật `AUTO_SEGMENT` và có
+           `ONUSLIBS_MAX_ROWS_PER_WINDOW`:
+               - Peek `X-Total-Count` 1 lần.
+               - Tự chia window thành nhiều segment nhỏ sao cho
+                 mỗi segment ~<= MAX_ROWS_PER_WINDOW (ước tính).
+        3) Với từng segment thời gian:
+               - Gọi `_fetch_single_window` để phân trang theo header.
+               - Nếu vẫn gặp lỗi 422 do pagination và `AUTO_SEGMENT=True`:
+                   -> fallback chia đôi segment theo thời gian tối đa
+                      `ONUSLIBS_MAX_SEGMENT_SPLIT_DEPTH` lần.
 
     Mục tiêu:
 
     - Khi dữ liệu ít (< limit server) -> chỉ 1 segment, số request tối thiểu.
     - Khi dữ liệu nhiều (> limit, gây 422) -> lib tự chia nhỏ datePeriod
-      mà không cần app phải chỉnh ONUSLIBS_DATE_SEGMENT_HOURS.
+      dựa trên số dòng ước tính, không cần dùng ONUSLIBS_DATE_SEGMENT_HOURS.
     """
     st = settings or OnusSettings()
     base_params: Dict[str, Any] = dict(params or {})
@@ -349,8 +349,8 @@ def fetch_json(
     raw_dp = base_params.get("datePeriod")
 
     # Cấu hình segmentation từ OnusSettings / ENV
-    hours = int(getattr(st, "date_segment_hours", 0) or 0)
     auto_segment = bool(getattr(st, "auto_segment", False))
+
     max_split_depth = getattr(st, "max_segment_split_depth", 0) or 0
     try:
         max_split_depth = int(max_split_depth)
@@ -358,6 +358,22 @@ def fetch_json(
         max_split_depth = 0
     if max_split_depth < 0:
         max_split_depth = 0
+
+    max_rows_conf = getattr(st, "max_rows_per_window", None)
+    try:
+        max_rows_per_window = int(max_rows_conf) if max_rows_conf is not None else 0
+    except Exception:
+        max_rows_per_window = 0
+    if max_rows_per_window < 0:
+        max_rows_per_window = 0
+
+    max_window_conf = getattr(st, "max_window_days", None)
+    try:
+        max_window_days = int(max_window_conf) if max_window_conf is not None else 0
+    except Exception:
+        max_window_days = 0
+    if max_window_days < 0:
+        max_window_days = 0
 
     seg_parallel_conf = bool(getattr(st, "segment_parallel", False))
     seg_workers_conf = getattr(st, "segment_max_workers", None)
@@ -384,7 +400,7 @@ def fetch_json(
             workers=workers,
         )
 
-    # ---- Có datePeriod + paginate=True: chuẩn bị segment theo thời gian ----
+    # ---- Có datePeriod + paginate=True: chuẩn bị window theo MAX_WINDOW_DAYS ----
     try:
         start_str, end_str = str(raw_dp).split(",", 1)
     except ValueError:
@@ -399,16 +415,120 @@ def fetch_json(
             f"datePeriod end < start: start={start_str!r}, end={end_str!r}"
         )
 
-    # Nếu hours <= 0 => 1 segment bao trùm toàn bộ khoảng thời gian
-    # Nếu > 0       => chia đều theo giờ (legacy/manual behaviour)
-    segments = _build_segments(start_dt, end_dt, hours) if hours > 0 else [
-        (start_dt, end_dt)
-    ]
-    if not segments:
-        segments = [(start_dt, end_dt)]
+    # Bước 1: chia thành các window theo ngày (nếu có MAX_WINDOW_DAYS)
+    windows: List[tuple[datetime, datetime]] = []
+    if max_window_days > 0:
+        cur = start_dt
+        delta = timedelta(days=max_window_days)
+        while cur < end_dt:
+            win_start = cur
+            win_end = cur + delta
+            if win_end > end_dt:
+                win_end = end_dt
+            windows.append((win_start, win_end))
+            cur = win_end
+    else:
+        windows.append((start_dt, end_dt))
 
-    # HttpClient dùng chung cho mọi segment
+    if not windows:
+        windows.append((start_dt, end_dt))
+
+    # HttpClient dùng chung cho mọi segment + request peek
     shared_client = _init_http_client(st, client)
+
+    # page_size hiệu lực để gửi lên API (dùng cả cho peek)
+    eff_page_size = page_size or getattr(st, "page_size", None) or 20000
+    try:
+        eff_page_size = int(eff_page_size)
+    except Exception:
+        eff_page_size = 20000
+    if eff_page_size <= 0:
+        eff_page_size = 20000
+
+    def _estimate_total_rows(seg_start: datetime, seg_end: datetime) -> Optional[int]:
+        """Peek 1 lần X-Total-Count cho 1 window.
+
+        Nếu header thiếu hoặc sai định dạng -> trả None để caller skip row-split.
+        """
+        seg_params = dict(base_params)
+        seg_params["datePeriod"] = f"{_to_iso(seg_start)},{_to_iso(seg_end)}"
+        seg_params["page"] = 0
+        seg_params["pageSize"] = eff_page_size
+
+        hdrs = build_headers(st)
+        if extra_headers:
+            hdrs = dict(hdrs)
+            hdrs.update(extra_headers)
+
+        resp = shared_client.get(endpoint, params=seg_params, headers=hdrs)
+
+        headers = resp.headers
+        total_val: Optional[str] = None
+        for k in ("X-Total-Count", "x-total-count", "X-Total-count", "x-total-Count"):
+            if k in headers:
+                total_val = headers.get(k)
+                break
+        if total_val is None:
+            log.warning(
+                "Row-segment: missing X-Total-Count header cho window %s..%s, bỏ qua chia theo rows.",
+                seg_start,
+                seg_end,
+            )
+            return None
+        try:
+            return int(total_val)
+        except Exception:
+            log.warning(
+                "Row-segment: invalid X-Total-Count=%r cho window %s..%s, bỏ qua chia theo rows.",
+                total_val,
+                seg_start,
+                seg_end,
+            )
+            return None
+
+    # Bước 2: từ windows -> segments sau khi tính toán theo MAX_ROWS_PER_WINDOW
+    segments: List[tuple[datetime, datetime]] = []
+
+    if auto_segment and max_rows_per_window > 0:
+        for win_start, win_end in windows:
+            total_rows = _estimate_total_rows(win_start, win_end)
+            if total_rows is None or total_rows <= 0 or total_rows <= max_rows_per_window:
+                # Không rõ / ít dòng -> giữ nguyên window
+                segments.append((win_start, win_end))
+                continue
+
+            # Tính số segment cần cắt (non-recursive)
+            n_segments = (total_rows + max_rows_per_window - 1) // max_rows_per_window
+            if n_segments <= 1:
+                segments.append((win_start, win_end))
+                continue
+
+            window_len = win_end - win_start
+            if window_len.total_seconds() <= 0:
+                segments.append((win_start, win_end))
+                continue
+
+            seg_len = window_len / n_segments
+            cur = win_start
+            for i in range(n_segments):
+                seg_start = cur
+                if i == n_segments - 1:
+                    seg_end = win_end
+                else:
+                    seg_end = seg_start + seg_len
+                if seg_end <= seg_start:
+                    # bảo vệ trường hợp rounding kỳ quặc
+                    seg_end = seg_start + timedelta(seconds=1)
+                    if seg_end > win_end:
+                        seg_end = win_end
+                segments.append((seg_start, seg_end))
+                cur = seg_end
+    else:
+        # Không bật auto-segment hoặc không cấu hình rows -> chỉ dùng windows
+        segments = list(windows)
+
+    if not segments:
+        segments.append((start_dt, end_dt))
 
     results: List[Dict[str, Any]] = []
     seen: set = set() if unique_key else set()
@@ -432,13 +552,13 @@ def fetch_json(
                     seen.add(k)
                 out.append(it)
             batch = out
-        if not batch:
-            return
+            if not batch:
+                return
         if on_batch:
             try:
                 on_batch(batch)
             except Exception as e:  # pragma: no cover - bảo vệ runtime
-                log.warning("on_batch raise (segment): %s", e)
+                log.warning("on_batch raise: %s", e)
         results.extend(batch)
 
     def _run_window(seg_start: datetime, seg_end: datetime) -> List[Dict[str, Any]]:
@@ -478,7 +598,7 @@ def fetch_json(
         return False
 
     def _run_with_split(seg_start: datetime, seg_end: datetime, depth: int) -> List[Dict[str, Any]]:
-        """Chạy 1 segment, nếu gặp 422 thì chia đôi theo thời gian (auto-segment).
+        """Chạy 1 segment, nếu gặp 422 thì chia đôi theo thời gian (auto-segment fallback 422).
 
         - Chỉ kích hoạt khi `auto_segment=True` và `max_split_depth>0`.
         - Nếu vượt quá depth cho phép vẫn 422 => log cảnh báo và raise.
@@ -518,7 +638,7 @@ def fetch_json(
         seg_start, seg_end = seg
         if auto_segment and max_split_depth > 0:
             return _run_with_split(seg_start, seg_end, 0)
-        # Legacy/manual: chỉ chạy 1 lần, không tự chia nhỏ
+        # Không bật auto-segment fallback 422 -> chỉ chạy 1 lần
         return _run_window(seg_start, seg_end)
 
     # ===== Chạy các segment (tuần tự hoặc song song tuỳ ENV) =====
