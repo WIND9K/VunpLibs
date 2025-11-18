@@ -1,235 +1,205 @@
 # -*- coding: utf-8 -*-
-"""
-Fetch commission history (VNDC) qua OnusLibs Facade – cấu hình tách ở đầu trang.
+"""Ví dụ chuẩn dùng OnusLibs: lấy lịch sử VNDC commission.
+
+Mục tiêu:
+- Code càng đơn giản càng tốt.
+- App chỉ quan tâm: endpoint, params (start/end date), fields.
+- Toàn bộ phân trang, segment, auto-segment... để OnusLibs xử lý qua `fetch_json`.
 
 Chạy mẫu:
-  python -m examples.get_commission  --date 2025-10-11
-  python -m examples.get_commission  --start-date 2025-10-11 --end-date 2025-10-11 --preset basic
-  python -m examples.get_commission  --date 2025-10-11 --fields date,amount,description
+  python -m examples.get_commission --date 2025-10-11
+  python -m examples.get_commission --start-date 2025-10-01 --end-date 2025-10-10
 """
 
 from __future__ import annotations
+
+import argparse
 import os
 import sys
-import argparse
-from typing import List, Dict, Any, Optional
-
-# =========================
-# CONFIG (tách biệt)
-# =========================
-ENDPOINT = "/api/vndc_commission/accounts/vndc_commission_acc/history"
-
-# Presets fields – đổi ở đây
-PRESETS: Dict[str, List[str]] = {
-    "minimal": ["date"],
-    "basic":   ["date","transactionNumber","relatedAccount.user.id","relatedAccount.user.display", "amount", "description"],
-    "full":    ["date", "amount", "description", "from.name", "to.name", "currency", "txId"],
-}
-
-# Mặc định params
-DEFAULT_PAGE_SIZE     = None
-DEFAULT_ORDER         = "dateAsc"  # hoặc "dateDesc"
-DEFAULT_FILTER        = "vndc_commission_acc.commission_buysell"
-DEFAULT_CHARGED_BACK  = "false"    # "true"/"false"
-
-# =========================
-# HELPERS (liên quan cấu hình)
-# =========================
-def _dedupe(seq) -> List[str]:
-    seen = set()
-    out: List[str] = []
-    for x in seq or []:
-        x = str(x).strip()
-        if not x or x in seen:
-            continue
-        seen.add(x)
-        out.append(x)
-    return out
-
-def resolve_fields(
-    *,
-    preset: Optional[str] = None,
-    fields_csv: Optional[str] = None,
-    fields_file: Optional[str] = None,
-) -> List[str]:
-    """
-    Hợp nhất fields từ preset + CSV + file (mỗi dòng 1 field). Ưu tiên: preset -> CSV -> file.
-    """
-    parts: List[str] = []
-    if preset:
-        ps = PRESETS.get(preset)
-        if ps is None:
-            raise SystemExit(f"Preset '{preset}' không tồn tại. Chọn: {', '.join(PRESETS)}")
-        parts.extend(ps)
-    if fields_csv:
-        parts.extend([p.strip() for p in fields_csv.split(",") if p.strip()])
-    if fields_file:
-        with open(fields_file, "r", encoding="utf-8") as f:
-            for line in f:
-                s = line.strip()
-                if s and not s.startswith("#"):
-                    parts.append(s)
-    parts = _dedupe(parts)
-    return parts or PRESETS["minimal"][:]  # fallback
-
-def _date_period_for_day(d: str) -> str:
-    return f"{d}T00:00:00.000,{d}T23:59:59.999"
-
-def _date_period_range(start_date: str, end_date: str) -> str:
-    return f"{start_date}T00:00:00.000,{end_date}T23:59:59.999"
-
-def build_params(
-    *,
-    date: Optional[str] = None,
-    start_date: Optional[str] = None,
-    end_date: Optional[str] = None,
-    charged_back: str = DEFAULT_CHARGED_BACK,
-    transfer_filters: str = DEFAULT_FILTER,
-    order: str = DEFAULT_ORDER,
-    # page: int = 0,
-) -> Dict[str, str]:
-    """
-    Trả dict params gọn để đưa thẳng vào fetch_json.
-    """
-    if date and (start_date or end_date):
-        raise SystemExit("Chỉ chọn 1 trong --date hoặc --start-date/--end-date")
-    if date:
-        dp = _date_period_for_day(date)
-    else:
-        if not (start_date and end_date):
-            raise SystemExit("Thiếu --end-date khi dùng --start-date")
-        dp = _date_period_range(start_date, end_date)
-
-    return {
-        "chargedBack":     charged_back,
-        "transferFilters": transfer_filters,
-        "datePeriod":      dp,
-        "orderBy":         order,
-        # KHÔNG set "page" – để HeaderPager tự xử lý
-    }
-
-def _parse_int(v) -> Optional[int]:
-    try:
-        return int(str(v).strip())
-    except Exception:
-        return None
-
-# =========================
-# RUNTIME (app chạy)
-# =========================
-# Thử import print_json (tools/print_json.py); nếu chạy trực tiếp file, thêm sys.path
-try:
-    from tools.print_json import print_json
-except ModuleNotFoundError:
-    sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-    try:
-        from tools.print_json import print_json
-    except Exception:
-        import json
-        def print_json(data: Any, **kwargs):
-            print(json.dumps(data, ensure_ascii=False, indent=2))
+from typing import Any, Dict, List, Optional
 
 from onuslibs.config.settings import OnusSettings
 from onuslibs.unified.api import fetch_json
-from onuslibs.http.client import HttpClient
-from onuslibs.security.headers import build_headers
+from onuslibs.utils.date_utils import build_date_period
 
-def try_get_api_total_count(settings: OnusSettings, endpoint: str, params: Dict[str, Any]) -> Optional[int]:
+# Thử import helpers in-house (không bắt buộc)
+try:
+    from tools.print_json import print_json
+except ModuleNotFoundError:  # fallback đơn giản
+    import json
+
+    def print_json(data: Any, **kwargs: Any) -> None:
+        print(json.dumps(data, ensure_ascii=False, indent=2))
+
+try:
+    from tools.write_csv import write_csv
+except ModuleNotFoundError:
+    def write_csv(rows: List[Dict[str, Any]], path: str) -> int:
+        """Fallback: ghi CSV rất đơn giản (chỉ phẳng level 1).
+
+        Trong project thật nên dùng tools.write_csv chuẩn.
+        """
+        import csv
+
+        if not rows:
+            return 0
+        fieldnames = sorted({k for r in rows for k in r.keys()})
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=fieldnames)
+            w.writeheader()
+            w.writerows(rows)
+        return len(rows)
+
+
+# =========================
+# CẤU HÌNH CỐ ĐỊNH
+# =========================
+
+# Endpoint Cyclos
+ENDPOINT = "/api/vndc_commission/accounts/vndc_commission_acc/history"
+
+# Bộ fields mặc định – đủ xài cho hầu hết báo cáo
+DEFAULT_FIELDS: List[str] = [
+    "date",
+    "transactionNumber",
+    "relatedAccount.user.id",
+    "relatedAccount.user.display",
+    "amount",
+    "description",
+]
+
+# Các filter cố định của endpoint
+DEFAULT_TRANSFER_FILTERS = "vndc_commission_acc.commission_buysell"
+DEFAULT_CHARGED_BACK = "false"       # 'true' / 'false'
+DEFAULT_ORDER = "dateAsc"            # dùng cho order_by trong fetch_json
+
+
+# =========================
+# HELPERS cấu hình / params
+# =========================
+
+def resolve_fields(fields_csv: Optional[str]) -> List[str]:
+    """Ghép fields: nếu CLI có --fields thì override, ngược lại dùng DEFAULT_FIELDS."""
+    if not fields_csv:
+        return DEFAULT_FIELDS[:]
+    parts = [p.strip() for p in fields_csv.split(",") if p.strip()]
+    return parts or DEFAULT_FIELDS[:]
+
+
+def build_params(start_date: str, end_date: str) -> Dict[str, Any]:
+    """Build params đơn giản cho fetch_json.
+
+    - Ghép datePeriod bằng helper của OnusLibs.
+    - Không set page / pageSize / orderBy ở đây (để fetch_json lo).
     """
-    Gọi 1 request nhỏ (page=0,pageSize=1) để đọc header X-Total-Count nếu có. Không ném lỗi.
-    """
-    cli = HttpClient(settings)
-    hdrs = build_headers(settings)
-    p = dict(params); p["page"] = 0; p["pageSize"] = 1
-    try:
-        resp = cli.get(endpoint, params=p, headers=hdrs)
-        resp.raise_for_status()
-        headers_l = {k.lower(): v for k, v in resp.headers.items()}
-        return _parse_int(headers_l.get("x-total-count"))
-    except Exception:
-        return None
-    finally:
-        try: cli.close()
-        except Exception: pass
+    date_period = build_date_period(start_date, end_date)
+    return {
+        "chargedBack": DEFAULT_CHARGED_BACK,
+        "transferFilters": DEFAULT_TRANSFER_FILTERS,
+        "datePeriod": date_period,
+    }
+
 
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="Fetch VNDC commission history via OnusLibs (config tách ở đầu file).")
+    p = argparse.ArgumentParser(
+        description="Fetch VNDC commission history qua OnusLibs (ví dụ đơn giản)."
+    )
+
     g = p.add_mutually_exclusive_group(required=True)
-    g.add_argument("--date", help="Ngày (YYYY-MM-DD).", default=None)
+    g.add_argument("--date", help="Lấy 1 ngày (YYYY-MM-DD).", default=None)
     g.add_argument("--start-date", help="Ngày bắt đầu (YYYY-MM-DD).", default=None)
-    p.add_argument("--end-date", help="Ngày kết thúc (YYYY-MM-DD) – bắt buộc nếu dùng --start-date.", default=None)
+    p.add_argument(
+        "--end-date",
+        help="Ngày kết thúc (YYYY-MM-DD) – bắt buộc nếu dùng --start-date.",
+        default=None,
+    )
 
-    # Fields (đã gom sẵn ở cấu hình)
-    p.add_argument("--preset", choices=list(PRESETS.keys()), default="basic",
-                   help=f"Chọn sẵn bộ fields: {', '.join(PRESETS.keys())} (mặc định basic).")
-    p.add_argument("--fields", help="CSV fields bổ sung/ghi đè.", default=None)
-    p.add_argument("--fields-file", help="File chứa danh sách fields (mỗi dòng 1 field).", default=None)
-
-    # Params khác dùng mặc định từ cấu hình
-    p.add_argument("--page-size", type=int, default=DEFAULT_PAGE_SIZE, help=f"pageSize mỗi trang (mặc định {DEFAULT_PAGE_SIZE}).")
-    p.add_argument("--order", choices=["dateAsc", "dateDesc"], default=DEFAULT_ORDER, help=f"Thứ tự theo API (mặc định {DEFAULT_ORDER}).")
-    p.add_argument("--filters", default=DEFAULT_FILTER, help=f"transferFilters (mặc định {DEFAULT_FILTER}).")
-    p.add_argument("--charged-back", choices=["true","false"], default=DEFAULT_CHARGED_BACK, help=f"chargedBack (mặc định {DEFAULT_CHARGED_BACK}).")
-
-    p.add_argument("--out-json", help="Ghi ra file JSON.", default=None)
-    # Bạn có thể thêm --out-csv nếu muốn, dùng tools.write_csv
+    p.add_argument(
+        "--fields",
+        help="Danh sách fields dạng CSV (override DEFAULT_FIELDS).",
+        default=None,
+    )
+    p.add_argument(
+        "--page-size",
+        type=int,
+        default=None,
+        help="pageSize mỗi trang (mặc định đọc từ ONUSLIBS_PAGE_SIZE).",
+    )
+    p.add_argument(
+        "--order",
+        choices=["dateAsc", "dateDesc"],
+        default=DEFAULT_ORDER,
+        help=f"Thứ tự sắp xếp (mặc định {DEFAULT_ORDER}).",
+    )
+    p.add_argument(
+        "--out-json",
+        help="Ghi toàn bộ kết quả ra file JSON.",
+        default=None,
+    )
+    p.add_argument(
+        "--out-csv",
+        help="Ghi kết quả ra CSV (mặc định: files/commission_history.csv nếu không chỉ định).",
+        nargs="?",
+        const="files/commission_history.csv",
+        default=None,
+    )
     return p
+
+
+# =========================
+# MAIN
+# =========================
 
 def main(argv: List[str]) -> int:
     args = build_parser().parse_args(argv)
 
-    # 1) Fields (preset/CSV/file)
-    fields = resolve_fields(
-        preset=args.preset,
-        fields_csv=args.fields,
-        fields_file=args.fields_file,
-    )
+    # 1) Xử lý ngày
+    if args.date:
+        start_date = end_date = args.date
+    else:
+        if not args.start_date or not args.end_date:
+            raise SystemExit("Phải truyền đủ --start-date và --end-date")
+        start_date = args.start_date
+        end_date = args.end_date
 
-    # 2) Params (tách ở đầu trang)
-    params = build_params(
-        date=args.date,
-        start_date=args.start_date,
-        end_date=args.end_date,
-        charged_back=args.charged_back,
-        transfer_filters=args.filters,
-        order=args.order,
-        # page=0,
-    )
+    # 2) Fields
+    fields = resolve_fields(args.fields)
 
-    # 3) Fetch
-    s = OnusSettings()  # tự nạp ENV/.env
+    # 3) Params cho fetch_json
+    params = build_params(start_date, end_date)
+
+    # 4) Gọi OnusLibs Facade
+    settings = OnusSettings()  # tự đọc .env / ENV (BASE_URL, PAGE_SIZE, auto-segment,…)
+
     rows: List[Dict[str, Any]] = fetch_json(
         endpoint=ENDPOINT,
         params=params,
-        fields=fields,          # list[str]
-        paginate=True,          # lịch sử → nên phân trang
+        fields=fields,
         page_size=args.page_size,
-        order_by=None,          # đã set orderBy trong params
-        settings=s,
-        unique_key=None,
+        paginate=True,          # lịch sử => nên phân trang
+        order_by=args.order,    # chuẩn hoá: order_by truyền riêng, không gắn trong params
+        settings=settings,
+        unique_key="transactionNumber",  # chống trùng nếu segment/time overlap
     )
 
-    # 4) Xuất & thống kê
-    # if args.out_json:
-    #     print_json(rows, to_file=args.out_json)
-    #     print(f"Đã ghi JSON: {len(rows)} dòng -> {args.out_json}")
-    # else:
-    #     print_json(rows)
-    #     print(f"\nTotal fetched rows: {len(rows)}")
-    from tools.print_json import print_json
-    print_json(len(rows))
+    # 5) Xuất kết quả
+    print(f"Fetched {len(rows)} rows.")
+    if args.out_json:
+        # print_json(rows, to_file=args.out_json)  # type: ignore[arg-type]
+        print(f"Đã ghi JSON: {args.out_json}")
+    else:
+        # In nhanh vài dòng đầu cho dev xem
+        # print_json(rows[:5])
+        if len(rows) > 5:
+            print(f"... (ẩn bớt, tổng cộng {len(rows)} dòng)")
 
-    api_total = try_get_api_total_count(s, ENDPOINT, params)
-    if api_total is not None:
-        print(f"API reported X-Total-Count: {api_total}")
-
-    from tools.write_csv import write_csv
-
-    out = "files/commission_history.csv"
-    n = write_csv(rows, out)  # auto dò cột, tự flatten nested dict
-    print(f"Đã ghi {n} dòng vào {out}")
+    if args.out_csv:
+        n = write_csv(rows, args.out_csv)
+        print(f"Đã ghi {n} dòng vào {args.out_csv}")
 
     return 0
+
 
 if __name__ == "__main__":
     raise SystemExit(main(sys.argv[1:]))

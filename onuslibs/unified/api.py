@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence
 
@@ -14,16 +15,15 @@ __all__ = ["fetch_json"]
 log = logging.getLogger(__name__)
 
 
-# ============================================================================
-# Helpers chung
-# ============================================================================
+# ========= Helpers chung =========
 
 
-def _normalize_fields(
-    fields: Optional[Sequence[str] | str],
-) -> Optional[str]:
-    """
-    Chấp nhận list/tuple hoặc CSV string -> trả về CSV sạch (hoặc None).
+def _normalize_fields(fields: Optional[Sequence[str] | str]) -> Optional[str]:
+    """Chuẩn hoá `fields` thành chuỗi CSV hoặc None.
+
+    - None / rỗng => None
+    - str         => tách theo dấu phẩy, strip từng phần
+    - sequence    => map sang str, strip từng phần
     """
     if not fields:
         return None
@@ -35,8 +35,14 @@ def _normalize_fields(
 
 
 def _extract_items(payload: Any) -> List[Dict[str, Any]]:
-    """
-    Ưu tiên: list -> pageItems -> items -> [].
+    """Trích danh sách item từ response JSON.
+
+    Ưu tiên:
+    - nếu payload là list            => trả luôn list
+    - nếu payload là dict và có key:
+        - 'pageItems' là list        => dùng pageItems
+        - 'items' là list            => dùng items
+    - ngược lại                      => []
     """
     if isinstance(payload, list):
         return list(payload)
@@ -49,32 +55,27 @@ def _extract_items(payload: Any) -> List[Dict[str, Any]]:
 
 
 def _soft_check_fields(items: List[Dict[str, Any]], fields_csv: Optional[str]) -> None:
-    """
-    Cảnh báo mềm nếu một số field top-level không có trong item đầu tiên.
-    Không raise để an toàn runtime.
+    """Cảnh báo mềm nếu một số field top-level không có trong item đầu tiên.
+
+    Không raise để an toàn runtime – chỉ log WARNING để dev kiểm tra.
     """
     if not items or not fields_csv:
         return
-    want = [p.strip() for p in fields_csv.split(",") if p.strip()]
-    if not want:
-        return
-    sample = items[0]
-    missing = [f for f in want if "." not in f and f not in sample]
+
+    first = items[0]
+    missing = [f for f in fields_csv.split(",") if f and f not in first]
     if missing:
-        log.warning("Thiếu một số field trong payload: %s", ", ".join(missing))
-
-
-# ============================================================================
-# Helpers cho datePeriod (segmentation)
-# ============================================================================
+        log.warning(
+            "strict_fields=True nhưng các field sau không có trong item đầu tiên: %s",
+            ", ".join(missing),
+        )
 
 
 def _parse_iso(dt_str: str) -> datetime:
-    """
-    Parse chuỗi ISO 8601 đơn giản thành datetime.
+    """Parse chuỗi ISO 8601 đơn giản thành datetime.
 
     - Hỗ trợ dạng có offset hoặc không offset.
-    - Nếu chỉ 'YYYY-MM-DD' thì tự thêm T00:00:00.
+    - Nếu chỉ 'YYYY-MM-DD' thì tự thêm 'T00:00:00'.
     """
     s = dt_str.strip()
     try:
@@ -86,24 +87,19 @@ def _parse_iso(dt_str: str) -> datetime:
 
 
 def _to_iso(dt: datetime) -> str:
-    """
-    Cắt microseconds, giữ nguyên tz, dùng cho datePeriod.
-    """
+    """Chuẩn hoá datetime sang ISO, bỏ microseconds (nếu có)."""
     if dt.microsecond:
         dt = dt.replace(microsecond=0)
     return dt.isoformat()
 
 
-def _build_segments(
-    start: datetime,
-    end: datetime,
-    hours: int,
-) -> List[tuple[datetime, datetime]]:
+def _build_segments(start: datetime, end: datetime, hours: int) -> List[tuple[datetime, datetime]]:
+    """Chia khoảng thời gian [start, end] thành các segment dài `hours` giờ.
+
+    - Nếu hours <= 0 hoặc start >= end => trả [(start, end)].
+    - Segment cuối có thể ngắn hơn, đảm bảo kết thúc đúng `end`.
     """
-    Chia [start, end] thành nhiều segment liên tiếp, mỗi segment
-    dài tối đa `hours` giờ.
-    """
-    if hours <= 0:
+    if hours <= 0 or end <= start:
         return [(start, end)]
 
     segments: List[tuple[datetime, datetime]] = []
@@ -120,24 +116,24 @@ def _build_segments(
             break
         cur = seg_end
 
+    if not segments:
+        segments.append((start, end))
     return segments
 
 
 def _init_http_client(st: OnusSettings, client: Optional[HttpClient]) -> HttpClient:
-    """
-    Khởi tạo HttpClient tương thích cả kiểu (settings) và (base_url: str).
+    """Khởi tạo HttpClient.
+
+    - Nếu caller đã truyền client => dùng lại (thuận tiện test / DI).
+    - Ngược lại, tạo HttpClient mới với base_url từ settings.
     """
     if client is not None:
         return client
-    try:
-        return HttpClient(st)
-    except TypeError:
-        return HttpClient(getattr(st, "base_url", ""))
+    # HttpClient hiện tại tự đọc OnusSettings nội bộ (rate-limit, timeout, HTTP/2...)
+    return HttpClient(st)
 
 
-# ============================================================================
-# 1 window (không tự cắt datePeriod)
-# ============================================================================
+# ---------- 1 window (1 datePeriod hoặc không dùng datePeriod) ----------
 
 
 def _fetch_single_window(
@@ -153,19 +149,22 @@ def _fetch_single_window(
     unique_key: Optional[str],
     on_batch: Optional[Callable[[List[Dict[str, Any]]], None]],
     client: Optional[HttpClient],
-    pager_func: Optional[Callable[..., Iterable[List[Dict[str, Any]]]]],
+    pager_func: Optional[
+        Callable[[HttpClient, str, Dict[str, Any], Dict[str, str], int], Iterable[List[Dict[str, Any]]]]
+    ],
     extra_headers: Optional[Dict[str, str]],
     parallel: bool,
     workers: Optional[int],
 ) -> List[Dict[str, Any]]:
-    """
-    Xử lý 1 'cửa sổ' dữ liệu:
+    """Xử lý 1 'cửa sổ' dữ liệu.
 
-      - build_headers
-      - build params (fields / orderBy / pageSize)
-      - phân trang bằng HeaderPager (hoặc pager DI / song song nếu có)
-      - hoặc single GET nếu paginate=False
-      - dedupe theo unique_key trong phạm vi cửa sổ này (nếu được yêu cầu)
+    Các bước:
+
+    - build_headers
+    - build params (fields / orderBy / pageSize)
+    - phân trang bằng HeaderPager (hoặc pager DI / song song nếu có)
+    - hoặc single GET nếu paginate=False
+    - dedupe theo unique_key trong phạm vi cửa sổ này (nếu được yêu cầu)
     """
     # 1) headers
     hdrs: Dict[str, str] = build_headers(st)
@@ -194,30 +193,47 @@ def _fetch_single_window(
     results: List[Dict[str, Any]] = []
     seen: set = set() if unique_key else set()
 
-    def _maybe_dedupe(batch: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        if not unique_key:
-            return batch
-        out: List[Dict[str, Any]] = []
-        for it in batch:
-            k = it.get(unique_key)
-            if k in seen:
-                continue
-            if k is not None:
-                seen.add(k)
-            out.append(it)
-        return out
+    def _merge_items(items: List[Dict[str, Any]]) -> None:
+        nonlocal results, seen
+        if not items:
+            return
+        if unique_key:
+            out: List[Dict[str, Any]] = []
+            for it in items:
+                k = it.get(unique_key)
+                if k in seen:
+                    continue
+                if k is not None:
+                    seen.add(k)
+                out.append(it)
+            items = out
+        if not items:
+            return
+        if on_batch:
+            try:
+                on_batch(items)
+            except Exception as e:  # pragma: no cover - bảo vệ runtime
+                log.warning("on_batch raise: %s", e)
+        results.extend(items)
 
     # 4) phân trang
     if paginate:
         pager = pager_func
 
         if pager is None and parallel:
-            try:  # optional
+            # Thử dùng parallel_pager nếu có
+            try:
                 from ..pagination.parallel_pager import (
                     header_fetch_all_parallel as _parallel,
                 )
 
-                def pager(cli2, ep, params=None, headers=None, page_size=None):
+                def pager(
+                    cli2: HttpClient,
+                    ep: str,
+                    params: Optional[Dict[str, Any]] = None,
+                    headers: Optional[Dict[str, str]] = None,
+                    page_size: Optional[int] = None,
+                ) -> Iterable[List[Dict[str, Any]]]:
                     return _parallel(
                         cli2,
                         ep,
@@ -232,7 +248,13 @@ def _fetch_single_window(
 
         if pager is None:
             # tuần tự dùng HeaderPager (chuẩn Cyclos)
-            def pager(cli2, ep, params=None, headers=None, page_size=None):
+            def pager(
+                cli2: HttpClient,
+                ep: str,
+                params: Optional[Dict[str, Any]] = None,
+                headers: Optional[Dict[str, str]] = None,
+                page_size: Optional[int] = None,
+            ) -> Iterable[List[Dict[str, Any]]]:
                 pg = HeaderPager(
                     cli2,
                     ep,
@@ -252,36 +274,21 @@ def _fetch_single_window(
             items = _extract_items(batch)
             if strict_fields:
                 _soft_check_fields(items, fields_csv)
-            items = _maybe_dedupe(items)
-            if not items:
-                continue
-            if on_batch:
-                try:
-                    on_batch(items)
-                except Exception as e:
-                    log.warning("on_batch raise: %s", e)
-            results.extend(items)
+            _merge_items(items)
+
         return results
 
-    # 4') single GET (không phân trang)
+    # không paginate: single GET
     resp = cli.get(endpoint, params=final_params, headers=hdrs)
-    resp.raise_for_status()
-    items = _extract_items(resp.json())
+    payload = resp.json()
+    items = _extract_items(payload)
     if strict_fields:
         _soft_check_fields(items, fields_csv)
-    items = _maybe_dedupe(items)
-    if on_batch and items:
-        try:
-            on_batch(items)
-        except Exception as e:
-            log.warning("on_batch raise: %s", e)
-    results.extend(items)
+    _merge_items(items)
     return results
 
 
-# ============================================================================
-# Facade duy nhất: fetch_json (có thể tự cắt datePeriod theo ENV)
-# ============================================================================
+# ---------- Facade chính: fetch_json ----------
 
 
 def fetch_json(
@@ -298,39 +305,67 @@ def fetch_json(
     on_batch: Optional[Callable[[List[Dict[str, Any]]], None]] = None,
     # DI / mở rộng
     client: Optional[HttpClient] = None,
-    pager_func: Optional[Callable[..., Iterable[List[Dict[str, Any]]]]] = None,
+    pager_func: Optional[
+        Callable[
+            [HttpClient, str, Dict[str, Any], Dict[str, str], int],
+            Iterable[List[Dict[str, Any]]],
+        ]
+    ] = None,
     extra_headers: Optional[Dict[str, str]] = None,
     # Parallel: nếu None -> dùng settings.pager_parallel (ONUSLIBS_PARALLEL)
     parallel: Optional[bool] = None,
     workers: Optional[int] = None,
 ) -> List[Dict[str, Any]]:
-    """
-    Facade GET JSON:
+    """Facade GET JSON (1 cửa sổ hoặc nhiều segment theo datePeriod).
+
+    Hành vi tổng quát:
 
     - Đọc base_url, page_size, rate-limit... từ OnusSettings (ENV).
-    - Nếu có datePeriod + ONUSLIBS_DATE_SEGMENT_HOURS > 0 + paginate=True:
-        -> tự chia datePeriod thành nhiều segment giờ cố định,
-           gọi _fetch_single_window cho từng segment.
-    - Ngược lại:
-        -> chỉ gọi _fetch_single_window 1 lần (không segment).
+    - Nếu **không có** `datePeriod` hoặc `paginate=False`:
+        -> chỉ gọi `_fetch_single_window` 1 lần (không cắt thời gian).
+    - Nếu có `datePeriod` và `paginate=True`:
+        - Luôn coi toàn bộ khoảng thời gian là 1 hoặc nhiều "segment" (tuỳ
+          `ONUSLIBS_DATE_SEGMENT_HOURS`).
+        - Nếu `ONUSLIBS_AUTO_SEGMENT=true` + xảy ra lỗi 422 do pagination:
+            -> tự động chia đôi segment theo thời gian (đến tối đa
+               `ONUSLIBS_MAX_SEGMENT_SPLIT_DEPTH` lần) và thử lại.
+        - Nếu `ONUSLIBS_AUTO_SEGMENT=false`:
+            -> chỉ cắt theo `ONUSLIBS_DATE_SEGMENT_HOURS` (nếu > 0),
+               không tự chia nhỏ thêm.
+
+    Mục tiêu:
+
+    - Khi dữ liệu ít (< limit server) -> chỉ 1 segment, số request tối thiểu.
+    - Khi dữ liệu nhiều (> limit, gây 422) -> lib tự chia nhỏ datePeriod
+      mà không cần app phải chỉnh ONUSLIBS_DATE_SEGMENT_HOURS.
     """
     st = settings or OnusSettings()
     base_params: Dict[str, Any] = dict(params or {})
 
     # parallel: nếu caller không truyền -> lấy từ ENV (pager_parallel)
-    eff_parallel: bool = (
-        bool(st.pager_parallel) if parallel is None else bool(parallel)
-    )
+    eff_parallel: bool = bool(st.pager_parallel) if parallel is None else bool(parallel)
 
-    raw_dp = base_params.get("datePeriod")
-    hours = getattr(st, "date_segment_hours", 0) or 0
     paginate = bool(paginate)
+    raw_dp = base_params.get("datePeriod")
 
-    # Quyết định segmentation: hoàn toàn theo ENV + có datePeriod hay không
-    do_segment = bool(paginate and raw_dp and hours > 0)
+    # Cấu hình segmentation từ OnusSettings / ENV
+    hours = int(getattr(st, "date_segment_hours", 0) or 0)
+    auto_segment = bool(getattr(st, "auto_segment", False))
+    max_split_depth = getattr(st, "max_segment_split_depth", 0) or 0
+    try:
+        max_split_depth = int(max_split_depth)
+    except Exception:
+        max_split_depth = 0
+    if max_split_depth < 0:
+        max_split_depth = 0
 
-    # ---- Không segment: 1 window duy nhất ----
-    if not do_segment:
+    seg_parallel_conf = bool(getattr(st, "segment_parallel", False))
+    seg_workers_conf = getattr(st, "segment_max_workers", None)
+    if not isinstance(seg_workers_conf, int) or seg_workers_conf <= 0:
+        seg_workers_conf = None
+
+    # ---- Không có datePeriod hoặc không phân trang: 1 window duy nhất ----
+    if not raw_dp or not paginate:
         return _fetch_single_window(
             st=st,
             endpoint=endpoint,
@@ -349,7 +384,7 @@ def fetch_json(
             workers=workers,
         )
 
-    # ---- Segment theo datePeriod ----
+    # ---- Có datePeriod + paginate=True: chuẩn bị segment theo thời gian ----
     try:
         start_str, end_str = str(raw_dp).split(",", 1)
     except ValueError:
@@ -364,34 +399,25 @@ def fetch_json(
             f"datePeriod end < start: start={start_str!r}, end={end_str!r}"
         )
 
-    segments = _build_segments(start_dt, end_dt, hours)
+    # Nếu hours <= 0 => 1 segment bao trùm toàn bộ khoảng thời gian
+    # Nếu > 0       => chia đều theo giờ (legacy/manual behaviour)
+    segments = _build_segments(start_dt, end_dt, hours) if hours > 0 else [
+        (start_dt, end_dt)
+    ]
     if not segments:
-        return _fetch_single_window(
-            st=st,
-            endpoint=endpoint,
-            params=base_params,
-            fields=fields,
-            page_size=page_size,
-            paginate=paginate,
-            order_by=order_by,
-            strict_fields=strict_fields,
-            unique_key=unique_key,
-            on_batch=on_batch,
-            client=client,
-            pager_func=pager_func,
-            extra_headers=extra_headers,
-            parallel=eff_parallel,
-            workers=workers,
-        )
+        segments = [(start_dt, end_dt)]
 
+    # HttpClient dùng chung cho mọi segment
     shared_client = _init_http_client(st, client)
 
     results: List[Dict[str, Any]] = []
     seen: set = set() if unique_key else set()
 
     def _merge_batch(batch: List[Dict[str, Any]]) -> None:
-        """
-        Gom kết quả từ 1 segment vào results, dedupe cross-segment theo unique_key.
+        """Gom kết quả từ 1 segment vào results, dedupe cross-segment.
+
+        - Nếu không có unique_key => chỉ append.
+        - Nếu có unique_key      => bỏ qua record trùng key across segment.
         """
         nonlocal results, seen
         if not batch:
@@ -411,12 +437,15 @@ def fetch_json(
         if on_batch:
             try:
                 on_batch(batch)
-            except Exception as e:
+            except Exception as e:  # pragma: no cover - bảo vệ runtime
                 log.warning("on_batch raise (segment): %s", e)
         results.extend(batch)
 
-    def _run_segment(seg: tuple[datetime, datetime]) -> List[Dict[str, Any]]:
-        seg_start, seg_end = seg
+    def _run_window(seg_start: datetime, seg_end: datetime) -> List[Dict[str, Any]]:
+        """Chạy fetch cho 1 cửa sổ thời gian cụ thể (không tự chia nhỏ).
+
+        Luôn override lại `datePeriod` theo (seg_start, seg_end).
+        """
         seg_params = dict(base_params)
         seg_params["datePeriod"] = f"{_to_iso(seg_start)},{_to_iso(seg_end)}"
         return _fetch_single_window(
@@ -428,7 +457,7 @@ def fetch_json(
             paginate=paginate,
             order_by=order_by,
             strict_fields=strict_fields,
-            unique_key=None,  # dedupe cross-segment ở ngoài
+            unique_key=None,  # dedupe cross-segment xử lý ở _merge_batch
             on_batch=None,
             client=shared_client,
             pager_func=pager_func,
@@ -437,9 +466,72 @@ def fetch_json(
             workers=workers,
         )
 
-    # hiện tại chạy segment tuần tự; nếu muốn, sau này có thể dùng st.segment_parallel
-    for seg in segments:
-        seg_rows = _run_segment(seg)
-        _merge_batch(seg_rows)
+    def _is_pagination_422(err: Exception) -> bool:
+        msg = str(err)
+        if "422" in msg and "Pagination error" in msg:
+            return True
+        cause = getattr(err, "__cause__", None)
+        if cause is not None:
+            cmsg = str(cause)
+            if "422" in cmsg and "Pagination error" in cmsg:
+                return True
+        return False
+
+    def _run_with_split(seg_start: datetime, seg_end: datetime, depth: int) -> List[Dict[str, Any]]:
+        """Chạy 1 segment, nếu gặp 422 thì chia đôi theo thời gian (auto-segment).
+
+        - Chỉ kích hoạt khi `auto_segment=True` và `max_split_depth>0`.
+        - Nếu vượt quá depth cho phép vẫn 422 => log cảnh báo và raise.
+        """
+        try:
+            return _run_window(seg_start, seg_end)
+        except Exception as e:  # pragma: no cover - bảo vệ runtime
+            if not (auto_segment and max_split_depth > 0 and _is_pagination_422(e)):
+                # Không phải 422 do pagination hoặc auto-segment tắt -> re-raise
+                raise
+            if depth >= max_split_depth:
+                log.error(
+                    "Auto-segment: reached max split depth=%s for window %s..%s nhưng API vẫn trả 422.",
+                    max_split_depth,
+                    seg_start,
+                    seg_end,
+                )
+                raise
+
+            # Chia đôi khoảng thời gian và thử lại hai nửa
+            mid = seg_start + (seg_end - seg_start) / 2
+            # Tránh phân đoạn zero-length (bảo vệ floating rounding)
+            if mid <= seg_start or mid >= seg_end:
+                log.error(
+                    "Auto-segment: cannot further split window %s..%s (depth=%s) - segment quá nhỏ.",
+                    seg_start,
+                    seg_end,
+                    depth,
+                )
+                raise
+
+            left_rows = _run_with_split(seg_start, mid, depth + 1)
+            right_rows = _run_with_split(mid, seg_end, depth + 1)
+            return left_rows + right_rows
+
+    def _process_segment(seg: tuple[datetime, datetime]) -> List[Dict[str, Any]]:
+        seg_start, seg_end = seg
+        if auto_segment and max_split_depth > 0:
+            return _run_with_split(seg_start, seg_end, 0)
+        # Legacy/manual: chỉ chạy 1 lần, không tự chia nhỏ
+        return _run_window(seg_start, seg_end)
+
+    # ===== Chạy các segment (tuần tự hoặc song song tuỳ ENV) =====
+    if seg_parallel_conf and len(segments) > 1:
+        max_workers = seg_workers_conf or getattr(st, "max_inflight", 4) or len(segments)
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_map = {executor.submit(_process_segment, seg): seg for seg in segments}
+            for fut in as_completed(future_map):
+                seg_rows = fut.result()
+                _merge_batch(seg_rows)
+    else:
+        for seg in segments:
+            seg_rows = _process_segment(seg)
+            _merge_batch(seg_rows)
 
     return results
