@@ -1,0 +1,472 @@
+OnusLibs – Tóm tắt kiến trúc & hybrid auto‑segment (v3)
+
+====================================
+1. MỤC TIÊU & TRIẾT LÝ THIẾT KẾ
+====================================
+
+OnusLibs là thư viện dùng chung để:
+
+- Gọi API Onus/Cyclos theo kiểu REST-first.
+- Ẩn toàn bộ phần phức tạp:
+  - Token & bảo mật (Keyring / ENV).
+  - HTTP/2, timeout, retry/backoff, rate-limit.
+  - Phân trang theo header Cyclos.
+  - Chia nhỏ datePeriod an toàn khi dữ liệu lớn (auto‑segment).
+- Cung cấp 1 Facade duy nhất cho app:
+  - onuslibs.unified.api.fetch_json(...)
+- Hỗ trợ kết nối DB MySQL dùng chung cho các job ETL / báo cáo.
+
+Mục tiêu: app chỉ cần quan tâm:
+- endpoint,
+- params (filter, datePeriod),
+- fields,
+còn lại OnusLibs xử lý.
+
+
+====================================
+2. KIẾN TRÚC TỔNG THỂ
+====================================
+
+2.1. config/OnusSettings
+------------------------
+
+- Đọc cấu hình từ:
+  - .env
+  - Biến môi trường hệ thống.
+- Chuẩn hoá thành object duy nhất:
+  - OnusSettings()
+- Các nhóm cấu hình chính:
+
+(1) HTTP & runtime:
+- base_url:        ONUSLIBS_BASE_URL
+- page_size:       ONUSLIBS_PAGE_SIZE
+- req_per_sec:     ONUSLIBS_REQ_PER_SEC
+- max_inflight:    ONUSLIBS_MAX_INFLIGHT
+- pager_parallel:  ONUSLIBS_PARALLEL
+- timeout_s:       ONUSLIBS_TIMEOUT_S
+- http2:           ONUSLIBS_HTTP2
+
+(2) Hybrid auto‑segment:
+- max_window_days:         ONUSLIBS_MAX_WINDOW_DAYS
+- auto_segment:            ONUSLIBS_AUTO_SEGMENT
+- max_rows_per_window:     ONUSLIBS_MAX_ROWS_PER_WINDOW
+- max_segment_split_depth: ONUSLIBS_MAX_SEGMENT_SPLIT_DEPTH
+- segment_parallel:        ONUSLIBS_SEGMENT_PARALLEL
+- segment_max_workers:     ONUSLIBS_SEGMENT_MAX_WORKERS
+
+(3) Legacy (không còn dùng trong fetch_json):
+- date_segment_hours: ONUSLIBS_DATE_SEGMENT_HOURS (giữ lại để tương thích, nhưng fetch_json v3 không sử dụng).
+
+(4) DB (nếu dùng module db.*):
+- DB_HOST, DB_USER, DB_PASSWORD, DB_NAME, DB_PORT, DB_SSL_CA
+  (thường đọc từ Keyring thông qua cùng service với token).
+
+2.2. security/build_headers
+---------------------------
+
+- Lấy token / secrets từ:
+  - ONUSLIBS_SECRETS_BACKEND=keyring
+  - ONUSLIBS_KEYRING_SERVICE=OnusLibs
+  - ONUSLIBS_ACCESS_TOKEN_ITEM=ACCESS_CLIENT_TOKEN
+- Trả về headers chuẩn:
+  - Authorization: Bearer <token>
+  - Accept: application/json
+  - Các header khác nếu cần.
+- Có cơ chế scrub token khi log.
+
+2.3. http/HttpClient
+--------------------
+
+- Wrapper trên httpx.Client:
+  - base_url = OnusSettings.base_url.
+  - timeout = timeout_s.
+  - HTTP/2 nếu ONUSLIBS_HTTP2=true.
+- Tích hợp:
+  - Rate limit theo req_per_sec.
+  - max_inflight (số request đồng thời).
+  - Retry/backoff cho lỗi mạng tạm thời.
+- Mọi request API (GET/POST/…) trong OnusLibs đều đi qua HttpClient.
+
+2.4. pagination/HeaderPager
+---------------------------
+
+- Phân trang theo chuẩn header Cyclos:
+  - X-Total-Count
+  - X-Page-Size
+  - X-Current-Page
+  - X-Page-Count
+  - X-Has-Next-Page
+- Cho phép:
+  - Đi tuần tự từng page,
+  - Hoặc song song nhiều page trong cùng một “window” (parallel).
+- Kết quả trả về dạng từng batch List[Dict].
+
+2.5. unified/api.fetch_json – Facade duy nhất
+---------------------------------------------
+
+- Public API chính:
+
+  rows = fetch_json(
+      endpoint: str,
+      params: dict,
+      *,
+      fields: list|csv|None,
+      page_size: int|None,
+      paginate: bool,
+      order_by: str|None,
+      strict_fields: bool,
+      unique_key: str|None,
+      settings: OnusSettings|None,
+      on_batch: callable|None,
+      parallel: bool|None,
+      workers: int|None,
+  )
+
+- Vai trò:
+  - Đọc OnusSettings (ENV-first).
+  - Chuẩn hoá params:
+    - fields (list → CSV),
+    - order_by,
+    - pageSize (nếu cần).
+  - Nếu không có datePeriod hoặc paginate=False:
+    - Gọi trực tiếp _fetch_single_window (không auto‑segment).
+  - Nếu có datePeriod + paginate=True:
+    - Áp dụng hybrid auto‑segment (mục 4).
+  - Gom kết quả từ nhiều segment:
+    - Dedupe theo unique_key (nếu có).
+    - Gọi on_batch trên từng batch nếu được cung cấp.
+
+2.6. db.*
+---------
+
+- Cung cấp các helper thao tác MySQL:
+  - healthcheck()
+  - query(sql, params)
+  - execute(sql, params)
+  - bulk_insert(table, rows)
+  - (tuỳ implementation) @transactional.
+- DB settings thường lấy từ cùng Keyring service với token.
+
+
+====================================
+3. CẤU HÌNH QUA .ENV (GỢI Ý)
+====================================
+
+Ví dụ .env tối thiểu cho job lấy lịch sử:
+
+# ---- HTTP & runtime ----
+ONUSLIBS_BASE_URL=https://wallet.vndc.io
+ONUSLIBS_PAGE_SIZE=2000
+ONUSLIBS_HTTP2=true
+ONUSLIBS_TIMEOUT_S=60
+
+ONUSLIBS_REQ_PER_SEC=2
+ONUSLIBS_MAX_INFLIGHT=4
+ONUSLIBS_PARALLEL=true          # phân trang song song
+
+# ---- Hybrid auto-segment ----
+ONUSLIBS_MAX_WINDOW_DAYS=1      # chia datePeriod thành các cửa sổ 1 ngày
+ONUSLIBS_MAX_ROWS_PER_WINDOW=8000
+ONUSLIBS_AUTO_SEGMENT=true
+ONUSLIBS_MAX_SEGMENT_SPLIT_DEPTH=4
+
+ONUSLIBS_SEGMENT_PARALLEL=true
+ONUSLIBS_SEGMENT_MAX_WORKERS=4
+
+# ---- Secrets / Token ----
+ONUSLIBS_SECRETS_BACKEND=keyring
+ONUSLIBS_KEYRING_SERVICE=OnusLibs
+ONUSLIBS_ACCESS_TOKEN_ITEM=ACCESS_CLIENT_TOKEN
+
+# ---- Legacy (không còn dùng trong fetch_json v3) ----
+ONUSLIBS_DATE_SEGMENT_HOURS=0
+
+
+====================================
+4. PHÂN TRANG & DATEPERIOD
+====================================
+
+4.1. Trường hợp KHÔNG có datePeriod
+-----------------------------------
+
+- fetch_json sẽ gọi _fetch_single_window duy nhất:
+  - Không có auto‑segment.
+  - HeaderPager xử lý phân trang thuần theo header.
+- Thích hợp cho các API:
+  - Không dùng datePeriod,
+  - Hoặc chỉ lấy lượng data nhỏ.
+
+4.2. Trường hợp CÓ datePeriod + paginate=True
+---------------------------------------------
+
+- fetch_json dùng hybrid auto‑segment v3:
+  1) Chia theo ngày (max_window_days).
+  2) Chia theo số dòng (max_rows_per_window) – dùng X-Total-Count.
+  3) Fallback 422 – chia đôi theo thời gian nếu vẫn lỗi.
+
+
+====================================
+5. HYBRID AUTO‑SEGMENT V3
+====================================
+
+Mục tiêu:
+
+- Không còn phụ thuộc ONUSLIBS_DATE_SEGMENT_HOURS để tránh 422.
+- Tự động chia nhỏ datePeriod khi dữ liệu lớn, dựa trên:
+  - ONUSLIBS_MAX_WINDOW_DAYS (chia theo ngày).
+  - ONUSLIBS_MAX_ROWS_PER_WINDOW (trần an toàn < giới hạn server ~10k record).
+- Giảm tối đa nguy cơ:
+  - Cyclos trả 422 khi đi tới page quá cao (vd page ≥ 5 với pageSize=2000).
+- Đảm bảo:
+  - Khi dữ liệu ít → 1 cửa sổ, ít request.
+  - Khi dữ liệu nhiều → tự chia segment, không cần chỉnh tay HOURS.
+
+5.1. Tầng 1 – chia theo ngày (max_window_days)
+----------------------------------------------
+
+Input: datePeriod = [start, end].
+
+- Nếu max_window_days > 0:
+  - Cắt [start, end] thành các window [w_start, w_end] sao cho:
+    - w_end - w_start ≤ max_window_days.
+    - Các window nối tiếp, phủ hết khoảng thời gian.
+- Nếu max_window_days = 0:
+  - Chỉ có 1 window: [start, end].
+
+=> Kết quả: danh sách windows.
+
+
+5.2. Tầng 2 – chia theo số dòng (max_rows_per_window)
+-----------------------------------------------------
+
+Áp dụng cho từng window [w_start, w_end] nếu:
+- auto_segment=True,
+- max_rows_per_window > 0.
+
+Bước 1 – Peek X-Total-Count (1 lần / window):
+
+- Gửi request:
+  - datePeriod = [w_start, w_end]
+  - page = 0
+  - pageSize = eff_page_size (từ param page_size hoặc ONUSLIBS_PAGE_SIZE)
+- Đọc header X-Total-Count = total_rows.
+- Nếu header thiếu hoặc không parse được:
+  - Log cảnh báo,
+  - Không chia theo rows, giữ nguyên window.
+
+Bước 2 – Quyết định số segment:
+
+- Nếu total_rows ≤ max_rows_per_window:
+  - Không cần chia, window là 1 segment.
+- Nếu total_rows > max_rows_per_window:
+  - n_segments = ceil(total_rows / max_rows_per_window).
+  - Chia đều [w_start, w_end] thành n_segments đoạn bằng nhau theo thời gian.
+    - seg_0 = [w_start, w_start + len/n_segments]
+    - seg_1 = [...]
+    - ...
+    - seg_{n-1} = [.., w_end]
+
+=> Mỗi segment có số dòng ước tính ≤ max_rows_per_window.
+
+Ví dụ:
+- max_rows_per_window = 8000
+- total_rows = 21594
+→ n_segments = ceil(21594 / 8000) = 3
+→ mỗi segment ~ 7k–8k rows.
+
+Kết quả:
+- Với pageSize=2000:
+  - Mỗi segment cần tối đa ~4 page,
+  - Không chạm page=5,
+  - Tránh lỗi 422 “kinh điển” khi server giới hạn ~10k record/window.
+
+Nếu auto_segment=False hoặc max_rows_per_window≤0:
+- Bỏ qua tầng này, segments = windows.
+
+
+5.3. Tầng 3 – Fallback 422 (max_segment_split_depth)
+-----------------------------------------------------
+
+Áp dụng trên từng segment [seg_start, seg_end]:
+
+- Hàm _run_window:
+  - Gọi _fetch_single_window với datePeriod = [seg_start, seg_end].
+  - HeaderPager xử lý phân trang.
+
+- Hàm _run_with_split(seg_start, seg_end, depth):
+
+  1) Thử _run_window:
+     - Nếu không lỗi → trả kết quả.
+  2) Nếu lỗi:
+     - Chỉ tiếp tục auto‑split nếu:
+       - auto_segment=True,
+       - max_segment_split_depth>0,
+       - Lỗi là “Pagination error … 422”.
+     - Nếu không thoả → raise lại lỗi.
+  3) Nếu là 422 và depth >= max_segment_split_depth:
+     - Log error:
+       - “Auto-segment: reached max split depth=... nhưng API vẫn trả 422.”
+     - Raise (không nuốt lỗi, không âm thầm bỏ qua data).
+  4) Nếu là 422 và còn quota depth:
+     - Chia đôi khoảng thời gian:
+       - mid = (seg_start and seg_end) / 2
+     - Gọi _run_with_split(seg_start, mid, depth+1),
+       rồi _run_with_split(mid, seg_end, depth+1),
+       gộp kết quả.
+
+Ý nghĩa:
+
+- Tầng 422 chỉ còn là “phao cứu sinh”.
+- Trường hợp 10k record kinh điển đã được xử lý từ tầng max_rows_per_window.
+- Nếu vẫn 422:
+  - Thử vài lần chia đôi,
+  - Nếu không được → fail rõ ràng, tránh dữ liệu thiếu mà không biết.
+
+
+====================================
+6. DEDUPE & SONG SONG
+====================================
+
+6.1. Dedupe theo unique_key
+---------------------------
+
+- fetch_json nhận tham số unique_key (vd "transactionNumber").
+- Khi gom kết quả từ nhiều segment:
+  - Dùng set “seen” lưu các giá trị key đã gặp.
+  - Bỏ qua record nào trùng key (cross‑segment).
+- Đảm bảo:
+  - Khi các segment thời gian bị overlap (do split), dữ liệu không bị trùng.
+
+6.2. on_batch
+-------------
+
+- Nếu truyền on_batch(batch):
+  - Mỗi lần fetch_json nhận được 1 batch (từ 1 segment), sẽ gọi on_batch trước khi append vào results.
+  - Hữu ích cho:
+    - Streaming ra file,
+    - Xử lý dần từng phần,
+    - Tránh giữ hết mọi thứ trong RAM nếu không cần.
+
+6.3. Song song
+--------------
+
+- Có 2 lớp song song:
+
+(1) Page-level:
+- parallel / pager_parallel:
+  - ONUSLIBS_PARALLEL=true
+  - Cho phép HeaderPager chạy nhiều page cùng lúc trong 1 window.
+
+(2) Segment-level:
+- segment_parallel / segment_max_workers:
+  - ONUSLIBS_SEGMENT_PARALLEL=true
+  - ONUSLIBS_SEGMENT_MAX_WORKERS=4 (ví dụ).
+  - Cho phép nhiều segment (window nhỏ sau split) chạy song song.
+
+Cả hai đều bị giới hạn bởi max_inflight, req_per_sec để an toàn với server.
+
+
+====================================
+7. VÍ DỤ SỬ DỤNG
+====================================
+
+7.1. Lịch sử hoa hồng: examples/get_commission.py
+-------------------------------------------------
+
+- endpoint:
+  - /api/vndc_commission/accounts/vndc_commission_acc/history
+- params:
+  - chargedBack=false
+  - transferFilters=vndc_commission_acc.commission_buysell
+  - datePeriod = build_date_period(start_date, end_date)
+- fields:
+  - date, transactionNumber, relatedAccount.user.id,
+    relatedAccount.user.display, amount, description
+- Gọi:
+
+  rows = fetch_json(
+      endpoint=ENDPOINT,
+      params=params,
+      fields=FIELDS,
+      page_size=args.page_size,
+      paginate=True,
+      order_by=args.order,          # "dateAsc"/"dateDesc"
+      settings=OnusSettings(),
+      unique_key="transactionNumber",
+  )
+
+- Vấn đề 422 kinh điển (do >10k record) được xử lý bởi:
+  - MAX_WINDOW_DAYS=1,
+  - MAX_ROWS_PER_WINDOW=8000,
+  - AUTO_SEGMENT=true.
+
+7.2. USDT onchain receive: examples/onchain_usdt_receive.py
+-----------------------------------------------------------
+
+- endpoint:
+  - /api/transfers
+- params:
+  - transferFilters=usdtacc.onchain_receive
+  - datePeriod=build_date_period(start_date, end_date)
+- fields:
+  - transactionNumber, date, amount,
+    from.user.id, from.user.display,
+    to.user.id, to.user.display,
+    type.internalName
+- Công dụng:
+  - Test hybrid auto‑segment trên range dài (vd 2025-11-01 → 2025-11-16).
+  - Ghi CSV nếu cần qua --out-csv.
+
+7.3. VNDC Offchain Send OnusPro: examples/pro_vndc_send.py
+----------------------------------------------------------
+
+- endpoint:
+  - /api/transfers
+- params:
+  - transferTypes=vndcacc.vndc_offchain_send_onuspro
+  - amountRange=""
+  - datePeriod=build_date_period(start_date, end_date)
+- fields:
+  - transactionNumber, date, amount,
+    from.user.id, from.user.display,
+    to.user.id, to.user.display,
+    type.internalName
+- Hỗ trợ:
+  - --date hoặc --start-date/--end-date
+  - --out-csv (mặc định files/pro_vndc_send.csv)
+- Dựa trên cùng 1 cơ chế hybrid auto‑segment.
+
+
+====================================
+8. NGUYÊN TẮC CỐT LÕI KHI PHÁT TRIỂN TIẾP
+====================================
+
+1) ENV-first, 1 Facade:
+   - Mọi job mới phải gọi qua fetch_json.
+   - Không gọi trực tiếp HttpClient + HeaderPager trong app.
+
+2) Không phá backward‑compat:
+   - Thêm tính năng → thêm field mới trong OnusSettings,
+   - Tránh đổi tên ENV nếu không thật sự cần.
+
+3) Hybrid phải an toàn hơn chứ không được tệ hơn:
+   - Khi tắt MAX_ROWS_PER_WINDOW hoặc AUTO_SEGMENT → behaviour phải tương đương auto‑segment cũ.
+   - Khi bật → xử lý được các case 10k record mà không vỡ job.
+
+4) Log rõ ràng:
+   - Khi split theo rows:
+     - log thông tin window, total_rows, n_segments.
+   - Khi fallback 422:
+     - log depth, khoảng thời gian đang split.
+   - Khi reach max depth vẫn 422:
+     - log error, raise → không nuốt lỗi.
+
+5) Đơn giản từ góc nhìn người dùng:
+   - Người viết job chỉ cần chọn:
+     - date range,
+     - endpoint, filters, fields,
+   - Không phải suy nghĩ nhiều về:
+     - segment theo giờ,
+     - page=bao nhiêu thì hên,
+     - manual retry.
+

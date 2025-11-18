@@ -3,83 +3,120 @@
 OnusLibs là thư viện **REST-first** để làm việc với hệ thống Cyclos/ONUS:
 
 - Gọi API qua **1 facade duy nhất**: `fetch_json`.
-- Ẩn toàn bộ phức tạp về:
+- Ẩn toàn bộ phức tạp:
   - HTTP client (timeout, HTTP/2, proxy, verify_ssl),
   - Token & bảo mật (Keyring hoặc ENV),
   - Rate-limit & max-inflight,
   - Phân trang theo header Cyclos,
-  - Cắt nhỏ `datePeriod` theo giờ (segment) khi cần,
+  - Cắt nhỏ `datePeriod` bằng **hybrid auto-segment** (chia theo ngày + số dòng) khi dữ liệu lớn,
   - Dedupe dữ liệu khi phân trang/segment.
 - Cung cấp module **DB** dùng chung cơ chế bảo mật (Keyring) với API:
-  - Config DB từ Keyring,
-  - Healthcheck, query, execute, bulk_insert,
-  - Decorator `@transactional` cho giao dịch.
+  - Config DB từ Keyring / ENV,
+  - Healthcheck, query, execute, bulk_insert.
 
 Mục tiêu: **App chỉ lo business**, còn hạ tầng (API/DB) do OnusLibs lo.
 
 ---
 
-## Kiến trúc & module chính
+## 1. Kiến trúc & module chính
 
-### 1. `config.settings.OnusSettings`
+### 1.1. `config.settings.OnusSettings`
 
-Đọc config từ ENV + `.env`:
+Đọc config từ ENV + `.env`, gom vào 1 object:
 
-- `ONUSLIBS_BASE_URL` – bắt buộc (ví dụ: `https://wallet.vndc.io`)
-- `ONUSLIBS_PAGE_SIZE`
-- `ONUSLIBS_REQ_PER_SEC`
-- `ONUSLIBS_MAX_INFLIGHT`
-- `ONUSLIBS_TIMEOUT_S`
-- `ONUSLIBS_HTTP2`
-- `ONUSLIBS_VERIFY_SSL`
-- `ONUSLIBS_PROXY`
-- `ONUSLIBS_PARALLEL`
-- `ONUSLIBS_DATE_SEGMENT_HOURS`
-- `ONUSLIBS_SEGMENT_PARALLEL`, `ONUSLIBS_SEGMENT_MAX_WORKERS` (dự phòng cho tương lai)
-- `ONUSLIBS_SECRETS_BACKEND` (`keyring`|`env`)
-- `ONUSLIBS_KEYRING_SERVICE`, `ONUSLIBS_KEYRING_ITEM`
-- `ONUSLIBS_FALLBACK_ENV`
-- `ONUSLIBS_TOKEN_HEADER`
-- `ONUSLIBS_LOG_LEVEL`, `ONUSLIBS_AUTO_DOTENV`, …
+- HTTP & runtime:
+  - `ONUSLIBS_BASE_URL` – bắt buộc (vd: `https://wallet.vndc.io`)
+  - `ONUSLIBS_PAGE_SIZE`
+  - `ONUSLIBS_REQ_PER_SEC`
+  - `ONUSLIBS_MAX_INFLIGHT`
+  - `ONUSLIBS_TIMEOUT_S`
+  - `ONUSLIBS_HTTP2`
+  - `ONUSLIBS_VERIFY_SSL`
+  - `ONUSLIBS_PROXY`
+  - `ONUSLIBS_PARALLEL` – phân trang song song theo page.
 
-### 2. `security.headers.build_headers`
+- **Hybrid auto-segment (v3):**
+  - `ONUSLIBS_MAX_WINDOW_DAYS` – chia `datePeriod` lớn thành nhiều “cửa sổ ngày” (vd: 1 ngày / window).
+  - `ONUSLIBS_MAX_ROWS_PER_WINDOW` – trần số record ước tính / window (dựa `X-Total-Count`).
+  - `ONUSLIBS_AUTO_SEGMENT` – bật/tắt auto-segment (mặc định `true`).
+  - `ONUSLIBS_MAX_SEGMENT_SPLIT_DEPTH` – số lần chia đôi tối đa khi fallback 422.
+  - `ONUSLIBS_SEGMENT_PARALLEL`, `ONUSLIBS_SEGMENT_MAX_WORKERS` – chạy nhiều segment thời gian song song.
 
-- Lấy token từ **Keyring** (service `ONUSLIBS_KEYRING_SERVICE`, item `ONUSLIBS_KEYRING_ITEM`),  
-  hoặc từ ENV nếu `ONUSLIBS_FALLBACK_ENV=true`.
-- Build headers chuẩn:
+- Legacy:
+  - `ONUSLIBS_DATE_SEGMENT_HOURS` – cấu hình segment theo giờ **cũ** (giữ lại cho code legacy, `fetch_json` v3 không dùng).
+
+- Bảo mật & logging:
+  - `ONUSLIBS_SECRETS_BACKEND` (`keyring`|`env`)
+  - `ONUSLIBS_KEYRING_SERVICE`, `ONUSLIBS_KEYRING_ITEM`
+  - `ONUSLIBS_FALLBACK_ENV`
+  - `ONUSLIBS_TOKEN_HEADER`
+  - `ONUSLIBS_LOG_LEVEL`, `ONUSLIBS_AUTO_DOTENV`, …
+
+---
+
+### 1.2. `security.headers.build_headers`
+
+- Lấy token từ **Keyring**:
+  - Service: `ONUSLIBS_KEYRING_SERVICE` (vd: `OnusLibs`)
+  - Item: `ONUSLIBS_KEYRING_ITEM` (vd: `ACCESS_CLIENT_TOKEN`)
+- Hoặc đọc token từ ENV nếu `ONUSLIBS_FALLBACK_ENV=true`.
+- Trả về headers chuẩn:
   - `Access-Client-Token: <token>`
   - `User-Agent: OnusLibs/3 (Python x.y.z)`
-  - Merge thêm `extra_headers` nếu caller truyền.
+  - Các header khác nếu cần.
 
-### 3. `http.client.HttpClient`
+---
 
-- Wrapper quanh `httpx`:
-  - base_url từ `OnusSettings.base_url`,
-  - timeout, verify_ssl, HTTP/2, proxy,
-  - (tuỳ config) limiter dựa trên `req_per_sec` & `max_inflight`.
-- API cơ bản:
-  - `get(path, params=None, headers=None)`
-  - (có thể có `post/put/delete`, tuỳ implementation thư viện của bạn).
+### 1.3. `http.client.HttpClient`
 
-### 4. `pagination.header_pager.HeaderPager`
+Wrapper trên `httpx`:
 
-- Phân trang theo **header chuẩn Cyclos**:
-  - `X-Has-Next-Page`
-  - `X-Page-Count`
-  - `X-Total-Count`
-- Tự điều khiển `page=0..N-1`.
-- API:
-  - `HeaderPager(client, endpoint, params, headers, page_size)`
-  - `fetch_all()` → Iterable các payload (mỗi page).
+- base_url = `OnusSettings.base_url`
+- timeout, verify_ssl, HTTP/2, proxy
+- Rate-limit theo `req_per_sec`, giới hạn song song theo `max_inflight`.
 
-### 5. `pagination.parallel_pager` (tuỳ chọn, nếu cài)
+API cơ bản:
+
+```python
+resp = client.get("/api/...", params=params, headers=headers)
+```
+
+Tất cả các request trong OnusLibs đi qua HttpClient.
+
+---
+
+### 1.4. `pagination.header_pager.HeaderPager`
+
+Phân trang theo chuẩn header Cyclos:
+
+- `X-Has-Next-Page`
+- `X-Page-Count`
+- `X-Total-Count`
+
+API:
+
+```python
+from onuslibs.pagination.header_pager import HeaderPager
+
+pager = HeaderPager(client, endpoint, params, headers, page_size=2000)
+for batch in pager.fetch_all():
+    ...
+```
+
+---
+
+### 1.5. `pagination.parallel_pager` (tuỳ chọn)
+
+Nếu cài thêm module song song:
 
 - `header_fetch_all_parallel`:
-  - Dùng `ThreadPoolExecutor` fetch nhiều page song song.
-  - Giới hạn bằng `workers` hoặc `ONUSLIBS_MAX_INFLIGHT`.
-- Nếu không import được → OnusLibs tự fallback về `HeaderPager` tuần tự.
+  - Dùng `ThreadPoolExecutor` để fetch nhiều page song song.
+  - Giới hạn bởi `workers` hoặc `ONUSLIBS_MAX_INFLIGHT`.
+- Nếu module này không tồn tại → tự động fallback về `HeaderPager` tuần tự.
 
-### 6. `unified.api.fetch_json` – Facade duy nhất
+---
+
+### 1.6. `unified.api.fetch_json` – Facade duy nhất
 
 Hàm trung tâm để đọc JSON từ API:
 
@@ -87,267 +124,7 @@ Hàm trung tâm để đọc JSON từ API:
 from onuslibs.unified.api import fetch_json
 ```
 
-- Nhận:
-  - `endpoint`, `params`,
-  - `fields`, `order_by`, `unique_key`,
-  - `page_size`, `paginate`,
-  - `strict_fields`, `on_batch`,
-  - `parallel` (hoặc đọc từ `ONUSLIBS_PARALLEL`),
-  - `settings`, `client`, …
-- Tự:
-  - Gắn `fields` → `params["fields"]`,
-  - Gắn `order_by` → `params["orderBy"]` (nếu có),
-  - Xử lý `page`, `pageSize`,
-  - Phân trang bằng header,
-  - (Nếu bật segment) cắt `datePeriod` thành nhiều khung giờ và gọi nhiều window,
-  - Dedupe theo `unique_key` toàn dataset,
-  - Gom kết quả thành `List[Dict]`.
-
-### 7. `utils.date_utils.build_date_period`
-
-Helper chung để build `datePeriod`:
-
-```python
-from onuslibs.utils.date_utils import build_date_period
-
-date_period = build_date_period("2025-10-11", "2025-10-11")
-# -> "2025-10-11T00:00:00.000,2025-10-11T23:59:59.999"
-```
-
-- Nhận `start_date`, `end_date` (string `"YYYY-MM-DD"` hoặc `datetime.date`).
-- Trả về `datePeriod` full-day, chuẩn dùng cho mọi endpoint có filter thời gian.
-
----
-
-# Module DB – Kết nối & thao tác CSDL
-
-Module DB của OnusLibs được thiết kế để:
-
-- **Dùng chung cơ chế bảo mật** với API:
-  - DB password, host, user… lấy từ **Keyring** (cùng service `OnusLibs`) hoặc ENV.
-- Cung cấp API đơn giản, đủ dùng cho:
-  - Healthcheck,
-  - Query (SELECT),
-  - Execute (INSERT/UPDATE/DELETE),
-  - Bulk insert.
-- Hỗ trợ **2 kiểu dùng**:
-  - Dùng nhanh qua **facade hàm**: `from onuslibs.db import query, execute, ...`
-  - Dùng nâng cao qua **class `DB`**: `DB(DbSettings.from_secure())`.
-
-> Mục tiêu: ETL mini / báo cáo (như OnusReport) có thể dùng OnusLibs cho cả **API** và **DB** mà không tự xử lý secret.
-
-## 1. Cấu hình secret DB
-
-Khuyến nghị lưu thông tin DB vào **Keyring**:
-
-Ví dụ (PowerShell):
-
-```powershell
-$svc="OnusLibs"
-
-python -c "import keyring; s='$svc'; keyring.set_password(s,'DB_HOST','127.0.0.1')"
-python -c "import keyring; s='$svc'; keyring.set_password(s,'DB_PORT','3306')"
-python -c "import keyring; s='$svc'; keyring.set_password(s,'DB_USER','onusreport')"
-python -c "import keyring; s='$svc'; keyring.set_password(s,'DB_PASSWORD','xxx')"
-python -c "import keyring; s='$svc'; keyring.set_password(s,'DB_NAME','onusreport')"
-python -c "import keyring; s='$svc'; keyring.set_password(s,'DB_SSL_CA','')"  # nếu không dùng SSL
-```
-
-- `ONUSLIBS_KEYRING_SERVICE` và `ONUSLIBS_KEYRING_ITEM` dùng cho token API,  
-  còn DB đọc từ các key riêng (`DB_HOST`, `DB_USER`, …) trong cùng service.
-- Có thể **bật fallback ENV** bằng `ONUSLIBS_FALLBACK_ENV=true` để ưu tiên ENV trước khi tra keyring.
-- Ngoài ra có thể cấu hình DB qua ENV, ví dụ trong `.env`:
-
-```env
-ONUSLIBS_DB_HOST=127.0.0.1
-ONUSLIBS_DB_PORT=3306
-ONUSLIBS_DB_USER=onusreport
-ONUSLIBS_DB_PASSWORD=xxx
-ONUSLIBS_DB_NAME=onusreport
-ONUSLIBS_DB_SSL_CA=
-ONUSLIBS_DB_CONNECT_TIMEOUT=10
-```
-
-## 2. DbSettings.from_secure
-
-Lớp cấu hình DB nằm trong `onuslibs.db.settings`:
-
-```python
-from onuslibs.db.settings import DbSettings
-
-# Đa số trường hợp chỉ cần gọi trống:
-db_settings = DbSettings.from_secure()
-
-# Hoặc ép fallback ENV trước, rồi mới tới keyring:
-db_settings = DbSettings.from_secure(fallback_env=True)
-```
-
-- `service`:
-  - Nếu không truyền → lấy từ `OnusSettings.keyring_service` hoặc ENV `ONUSLIBS_KEYRING_SERVICE` (mặc định `"OnusLibs"`).
-- `fallback_env`:
-  - Nếu `True` → ưu tiên đọc ENV trước, sau đó mới tra Keyring.
-  - Nếu `False` (hoặc không set, mà `OnusSettings.fall_back_env` là false) → đọc Keyring trước, ENV là dự phòng.
-- Bên trong, `DbSettings.from_secure` sẽ đọc lần lượt:
-  - `ONUSLIBS_DB_HOST` hoặc Keyring `"DB_HOST"`,
-  - `ONUSLIBS_DB_USER` hoặc Keyring `"DB_USER"`,
-  - `ONUSLIBS_DB_PASSWORD` hoặc Keyring `"DB_PASSWORD"`,
-  - `ONUSLIBS_DB_NAME` hoặc Keyring `"DB_NAME"`,
-  - `ONUSLIBS_DB_PORT` hoặc Keyring `"DB_PORT"` (mặc định `3306`),
-  - `ONUSLIBS_DB_SSL_CA` hoặc Keyring `"DB_SSL_CA"` (nếu dùng SSL),
-  - `ONUSLIBS_DB_CONNECT_TIMEOUT` hoặc Keyring `"DB_CONNECT_TIMEOUT"` (mặc định `10` giây).
-
-Object `DbSettings` cung cấp thêm:
-
-```python
-db_settings.safe_dict()  # Trả về dict cấu hình để log/debug, KHÔNG chứa password
-```
-
-## 3. Dùng nhanh: facade `onuslibs.db` (khuyến nghị cho app/ETL)
-
-Module `onuslibs.db` export sẵn các hàm:
-
-- `healthcheck()` – kiểm tra DB bằng SELECT 1.
-- `query(sql, params=None)` – chạy SELECT, trả list[dict].
-- `execute(sql, params=None)` – chạy INSERT/UPDATE/DELETE 1 câu lệnh.
-- `bulk_insert(sql, rows, batch_size=1000)` – insert nhiều dòng hiệu quả.
-- và class `DbSettings` nếu cần dùng cấu hình tuỳ chỉnh.
-
-Cách dùng đơn giản nhất:
-
-```python
-from onuslibs.db import DbSettings, healthcheck, query, execute, bulk_insert
-
-# 1) Kiểm tra kết nối
-print("DB OK?", healthcheck())
-
-# 2) SELECT vài dòng từ onchain_diary
-rows = query("SELECT * FROM onchain_diary LIMIT %s", (5,))
-for r in rows:
-    print(r)
-
-# 3) INSERT 1 record vào bảng tmp_onuslibs_smoke
-execute(
-    "INSERT INTO tmp_onuslibs_smoke(id, name, score) VALUES (%s,%s,%s)",
-    (123, "smoke test", 100),
-)
-
-# 4) BULK INSERT nhiều dòng
-rows_to_insert = [
-    (2001, "bulk-1", 10),
-    (2002, "bulk-2", 20),
-]
-bulk_insert(
-    "INSERT INTO tmp_onuslibs_smoke(id, name, score) VALUES (%s,%s,%s)",
-    rows_to_insert,
-    batch_size=1000,
-)
-```
-
-Hành vi:
-
-- Lần đầu gọi `healthcheck/query/execute/bulk_insert` mà **không truyền `settings`**, OnusLibs sẽ:
-  - Tự gọi `DbSettings.from_secure()` để lấy cấu hình DB,
-  - Tạo một instance `DB` nội bộ và cache lại.
-- Các lần gọi sau reuse lại `DB` đó → đỡ phải đọc config/keyring nhiều lần.
-- Nếu muốn dùng cấu hình DB khác cho 1 call cụ thể, có thể truyền `settings`:
-
-```python
-custom_settings = DbSettings(
-    host="127.0.0.1",
-    user="root",
-    password="xxx",
-    name="test_db",
-)
-
-rows = query("SELECT 1", settings=custom_settings)
-```
-
-## 4. Dùng nâng cao: class `DB` (cần kiểm soát nhiều hơn)
-
-Module core DB nằm tại `onuslibs.db.core` với lớp `DB`:
-
-```python
-from onuslibs.db.settings import DbSettings
-from onuslibs.db.core import DB
-
-# 1) Lấy cấu hình DB từ keyring + ENV
-db_settings = DbSettings.from_secure()
-
-# 2) Tạo instance DB
-db = DB(settings=db_settings)
-
-# 3) Healthcheck
-ok = db.healthcheck()
-if not ok:
-    raise SystemExit("DB healthcheck failed")
-
-# 4) Query (SELECT)
-rows = db.query("SELECT * FROM onchain_diary WHERE userid = %s LIMIT 10", (123,))
-
-# 5) Execute (INSERT/UPDATE/DELETE 1 câu lệnh)
-affected = db.execute(
-    "UPDATE tmp_onuslibs_smoke SET score = %s WHERE id = %s",
-    (100, 1),
-)
-
-# 6) Bulk insert (INSERT nhiều dòng hiệu quả)
-rows_to_insert = [
-    (1, "Alice", 90),
-    (2, "Bob", 85),
-]
-sql_insert = "INSERT INTO tmp_onuslibs_smoke (id, name, score) VALUES (%s, %s, %s)"
-total_inserted = db.bulk_insert(sql_insert, rows_to_insert, batch_size=1000)
-```
-
-Giải thích nhanh:
-
-- `DB.healthcheck()`:
-  - Mở kết nối, chạy `SELECT 1`, trả về `True/False` (không raise nếu lỗi).
-- `DB.query(sql, params)`:
-  - Mở kết nối, chạy SELECT, trả list[dict] (nếu dùng `DictCursor`).
-- `DB.execute(sql, params)`:
-  - Mở kết nối, chạy 1 câu lệnh write (INSERT/UPDATE/DELETE), `commit`, trả số dòng ảnh hưởng.
-- `DB.bulk_insert(sql, rows, batch_size=1000)`:
-  - Dùng `executemany` theo batch để insert nhanh,
-  - `rows` là iterable các tuple giá trị,
-  - `sql` là câu INSERT với placeholder `%s`,
-  - Trả tổng số dòng đã insert.
-
-> Lưu ý: mọi hàm đều **tự mở/đóng connection**, phù hợp cho script ETL, không cần tự quản lý pool.
-
-## 5. Gợi ý mở rộng: decorator `@transactional` (tương lai)
-
-Hiện tại module DB **chưa triển khai** decorator `@transactional`, nhưng README giữ lại phần này như định hướng kiến trúc:
-
-- Ý tưởng:
-  - Bọc logic business trong 1 transaction,
-  - Tự `commit` nếu không lỗi, `rollback` nếu có exception.
-- Mẫu API mong muốn trong tương lai (chưa có trong code):
-
-```python
-from onuslibs.db.core import DB, transactional
-
-db = DB(DbSettings.from_secure())
-
-@transactional(db)
-def process_user(cur, user_id: int):
-    cur.execute("UPDATE users SET status = %s WHERE id = %s", ("ACTIVE", user_id))
-    cur.execute("INSERT INTO logs(user_id, action) VALUES (%s, %s)", (user_id, "activate"))
-```
-
-Khi decorator này được bổ sung, OnusLibs sẽ hỗ trợ tốt hơn cho các pipeline ETL phức tạp cần nhiều câu lệnh SQL trong cùng 1 transaction.
-
----
-
----
-
-# Facade `fetch_json` – Cách dùng chi tiết
-
-```python
-from onuslibs.unified.api import fetch_json
-```
-
-### Chữ ký (tóm tắt)
+**Chữ ký tóm tắt:**
 
 ```python
 rows = fetch_json(
@@ -370,52 +147,36 @@ rows = fetch_json(
 ) -> list[dict]
 ```
 
-### Nhóm param **app** cần quan tâm
+**Behaviour chính:**
 
-- `endpoint`: path endpoint (không bao gồm base_url).
-- `params`:
-  - Mọi query param business (`transferTypes`, `user`, `chargedBack`, …)
-  - `datePeriod` (nên dùng `build_date_period` để ghép).
-- `fields`: list hoặc CSV, OnusLibs sẽ gắn vào `params["fields"]`.
-- `order_by`: optional, gắn vào `params["orderBy"]`.
-- `unique_key`: tên field dedupe (ví dụ `"transactionNumber"`).
-
-### Phân trang & parallel
-
-- `page_size`:
-  - `None` → `ONUSLIBS_PAGE_SIZE`.
-  - Set giá trị → override.
-- `paginate`:
-  - `True` → phân trang (HeaderPager/parallel_pager).
-  - `False` → GET 1 lần.
-- `parallel`:
-  - `None` → đọc từ `ONUSLIBS_PARALLEL`.
-  - `True`/`False` → ép bật/tắt page-parallel cho call hiện tại.
-
-### strict_fields & on_batch
-
-- `strict_fields=True`:
-  - Check thiếu field top-level (theo `fields`) → log warning.
-- `on_batch(batch)`:
-  - Được gọi sau mỗi batch (page/segment) đã dedupe.
-  - Các batch vẫn được gom vào kết quả trả về (trừ khi bạn bỏ qua `rows` và chỉ dùng on_batch).
+- Đọc `OnusSettings` (ENV-first).
+- Chuẩn hoá `params`:
+  - `fields` (list → CSV),
+  - `order_by` → `params["orderBy"]`,
+  - `pageSize` nếu cần.
+- Nếu **không có** `datePeriod` hoặc `paginate=False`:
+  - Gọi `_fetch_single_window` – không auto-segment.
+- Nếu **có** `datePeriod` + `paginate=True`:
+  - Áp dụng **hybrid auto-segment v3** (xem phần 2).
+- Dedupe theo `unique_key` trên toàn dataset (cross-window / cross-segment).
+- Gom kết quả thành `List[Dict]`.
+- Nếu có `on_batch`:
+  - Gọi `on_batch(batch)` sau mỗi batch (page/segment) đã dedupe.
 
 ---
 
-# Helper `build_date_period`
+### 1.7. `utils.date_utils.build_date_period`
+
+Helper build `datePeriod` full-day:
 
 ```python
 from onuslibs.utils.date_utils import build_date_period
 
-date_period = build_date_period(start_date, end_date)
+date_period = build_date_period("2025-10-11", "2025-10-11")
+# -> "2025-10-11T00:00:00.000,2025-10-11T23:59:59.999"
 ```
 
-- `start_date`, `end_date`:
-  - `"YYYY-MM-DD"` hoặc `datetime.date`.
-- Output:
-  - `"YYYY-MM-DDT00:00:00.000,YYYY-MM-DDT23:59:59.999"`.
-
-App pattern chuẩn:
+Pattern chuẩn trong app:
 
 ```python
 params = {
@@ -433,149 +194,277 @@ rows = fetch_json(
 
 ---
 
-# CLI — Tham số chi tiết & `-h/--help`
+## 2. Hybrid auto-segment v3
 
-Các script CLI trong `examples/` đều dùng **argparse**, vì vậy luôn có trợ giúp:
+Hybrid auto-segment giải quyết bài toán:
 
-```bash
-python -m examples.fetch_commission_history -h
-python -m examples.get_commission -h
-python -m examples.pro_vndc_send -h
-```
+- `datePeriod` dài,
+- nhiều record,
+- API giới hạn ~10k record / window → dễ dính 422 “kinh điển” nếu đi quá nhiều page.
 
-Dưới đây là tóm tắt những script chính.
+### 2.1. Biến ENV liên quan
 
----
+- `ONUSLIBS_MAX_WINDOW_DAYS`
+  - Chia `datePeriod` lớn thành nhiều **cửa sổ ngày**.
+  - Ví dụ: `1` → mỗi window tối đa 1 ngày.
 
-## `examples.fetch_commission_history`
+- `ONUSLIBS_MAX_ROWS_PER_WINDOW`
+  - Trần số record ước tính mỗi window (dựa `X-Total-Count`).
+  - Ví dụ: `8000` (nhỏ hơn 10k để an toàn).
 
-Kéo lịch sử hoa hồng theo ngày/khoảng ngày.  
-App build `params` từ CLI, còn `fetch_json(...)` lo phân trang/lấy dữ liệu.
+- `ONUSLIBS_AUTO_SEGMENT`
+  - Bật/tắt hybrid auto-segment (mặc định `true`).
 
-**Flags chính**
+- `ONUSLIBS_MAX_SEGMENT_SPLIT_DEPTH`
+  - Giới hạn số lần chia đôi khi fallback 422 (vd: 4).
 
-- `--date YYYY-MM-DD`  
-  Lấy dữ liệu trong **1 ngày** (00:00:00 → 23:59:59).
-- `--start-date YYYY-MM-DD` `--end-date YYYY-MM-DD`  
-  Lấy dữ liệu trong **khoảng ngày** (bao gồm cả ngày cuối).
-- `--preset {minimal,basic,full}` *(mặc định: `basic`)*  
-  Bộ `fields` có sẵn:
-  - `minimal`: rất ít field, dùng kiểm nhanh.
-  - `basic`: đủ field cho phân tích thường ngày.
-  - `full`: đầy đủ hơn (tuỳ script).
-- `--fields a,b,c` | `--fields-file path.txt`  
-  Ghi đè/thêm `fields` (CSV hoặc file mỗi dòng 1 field).
-- `--page-size N`  
-  Ghi đè `pageSize` cho lần chạy này. Nếu không đặt, lấy từ `ONUSLIBS_PAGE_SIZE`.
-- `--order {dateAsc,dateDesc}`  
-  Gửi lên API qua `orderBy`.
-- `--filters <transferFilters>`  
-  Gửi lên API `transferFilters`, ví dụ: `vndc_commission_acc.commission_buysell`.
-- `--charged-back {true,false}`  
-  Gửi lên API `chargedBack`.
-- `--out-json file.json` / `--out-csv file.csv`  
-  Xuất dữ liệu ra file (CSV dùng helper flatten dot-path).
+- `ONUSLIBS_SEGMENT_PARALLEL`, `ONUSLIBS_SEGMENT_MAX_WORKERS`
+  - Cho phép xử lý các segment thời gian song song.
 
-**Flags phân trang/hiệu năng**
-
-- `--parallel`  
-  Bật **đọc song song** các trang (song song theo page).  
-- `--workers N`  
-  Số luồng khi `--parallel` (mặc định lấy từ `ONUSLIBS_MAX_INFLIGHT`).
-- `--page-size N`  
-  (nhắc lại) Kích thước trang – ảnh hưởng trực tiếp đến số trang và lỗi 422.
-
-**Flags debug (test)**
-
-- `--debug-flow`  
-  In log từng trang để quan sát.
-- `--delay-ms N`  
-  Ngủ N ms trước mỗi request (dễ xem log).
-- `--max-pages N`  
-  Giới hạn số trang để demo/kiểm thử.
-- `--print-total`  
-  In tổng record sau khi gom.
-
-**Ví dụ**
-
-```bash
-# 1 ngày, preset basic, tuần tự
-python -m examples.fetch_commission_history   --date 2025-10-11 --preset basic --page-size 2000
-
-# Quan sát tuần tự: log + delay + limit 5 page
-python -m examples.fetch_commission_history   --date 2025-10-11 --preset basic   --page-size 400 --debug-flow --delay-ms 300 --max-pages 5
-
-# Đa luồng (nếu endpoint an toàn, orderBy ổn định)
-python -m examples.fetch_commission_history   --date 2025-10-11 --preset basic   --page-size 2000 --parallel --workers 4
-```
+> `ONUSLIBS_DATE_SEGMENT_HOURS` chỉ còn cho legacy, **fetch_json v3 không dùng**.
 
 ---
 
-## `examples.get_commission`
+### 2.2. Luồng 3 tầng
 
-Phiên bản gọn, tập trung **xuất JSON nhanh**.
+**Tầng 1 – chia theo ngày (`MAX_WINDOW_DAYS`)**
 
-**Flags chính**
+- Input: `datePeriod = [start, end]`.
+- Nếu `MAX_WINDOW_DAYS > 0`:
+  - Cắt thành nhiều `window = [w_start, w_end]` sao cho `w_end - w_start <= MAX_WINDOW_DAYS`.
+- Nếu `MAX_WINDOW_DAYS = 0`:
+  - Không chia → 1 window = toàn `datePeriod`.
 
-- `--date` **hoặc** `--start-date/--end-date`
-- `--preset {minimal,basic,full}`
-- `--fields a,b,c` | `--fields-file path.txt`
-- `--page-size N`
-- `--order {dateAsc,dateDesc}`
-- `--filters <transferFilters>`
-- `--charged-back {true,false}`
-- `--out-json file.json`
+**Tầng 2 – chia theo số dòng (`MAX_ROWS_PER_WINDOW`)**
 
-**Ví dụ**
+Cho mỗi `window`:
 
-```bash
-python -m examples.get_commission   --date 2025-10-11   --preset full   --page-size 2000   --out-json commission_2025-10-11.json
+1. Peek `X-Total-Count` 1 lần:
+   - Gửi request với:
+     - `datePeriod = window`,
+     - `page=0`,
+     - `pageSize = eff_page_size` (từ `page_size arg` hoặc `ONUSLIBS_PAGE_SIZE`).
+   - Đọc header `X-Total-Count = total_rows`.
+
+2. Quyết định:
+
+- Nếu:
+  - `auto_segment=False`, hoặc
+  - `MAX_ROWS_PER_WINDOW <= 0`, hoặc
+  - không đọc được `X-Total-Count`,
+  → giữ nguyên window (không chia).
+
+- Nếu `total_rows <= MAX_ROWS_PER_WINDOW`:
+  → window trở thành 1 segment.
+
+- Nếu `total_rows > MAX_ROWS_PER_WINDOW`:
+  - Tính: `n_segments = ceil(total_rows / MAX_ROWS_PER_WINDOW)`.
+  - Chia `window` thành `n_segments` đoạn bằng nhau theo **thời gian**.
+
+Ví dụ:
+
+- `MAX_ROWS_PER_WINDOW = 8000`
+- `total_rows = 21594`
+- `n_segments = ceil(21594 / 8000) = 3`
+  → Mỗi segment ~ 7k–8k record.
+
+Kết quả:
+
+- Với `pageSize = 2000`, mỗi segment cần tối đa ~4 page.
+- Không chạm page quá cao → giảm nguy cơ 422 do giới hạn 10k record.
+
+**Tầng 3 – fallback 422 (`MAX_SEGMENT_SPLIT_DEPTH`)**
+
+Nếu khi fetch segment vẫn gặp lỗi **pagination 422**:
+
+- Hàm `_run_with_split(seg_start, seg_end, depth)`:
+
+  1. Thử `_run_window(seg_start, seg_end)`:
+     - Nếu OK → dùng kết quả.
+
+  2. Nếu lỗi:
+     - Chỉ xử lý tiếp nếu:
+       - `auto_segment=True`,
+       - `MAX_SEGMENT_SPLIT_DEPTH > 0`,
+       - lỗi đúng pattern “Pagination error … 422”.
+     - Nếu không thoả → raise lại lỗi.
+
+  3. Nếu 422 và `depth >= MAX_SEGMENT_SPLIT_DEPTH`:
+     - Log error: “reached max split depth … nhưng API vẫn trả 422”.
+     - Raise → **không âm thầm bỏ qua data**.
+
+  4. Nếu 422 và còn quota depth:
+     - Chia đôi thời gian: `mid = (seg_start + seg_end)/2`.
+     - Gọi `_run_with_split(seg_start, mid, depth+1)` và `_run_with_split(mid, seg_end, depth+1)`.
+     - Gộp kết quả 2 bên.
+
+---
+
+## 3. Dedupe & song song
+
+### 3.1. Dedupe theo `unique_key`
+
+- `fetch_json` nhận tham số `unique_key` (vd: `"transactionNumber"`).
+- Khi gom data từ nhiều segment:
+  - Dùng `set` lưu các key đã gặp.
+  - Bỏ qua record có key trùng.
+- Đảm bảo không bị duplicate khi segment/time bị overlap.
+
+### 3.2. `on_batch`
+
+- Nếu truyền `on_batch(batch)`:
+  - Sau mỗi batch (đã dedupe), `fetch_json` sẽ gọi `on_batch`.
+- Hữu ích khi:
+  - Stream dữ liệu ra file,
+  - Xử lý dần từng phần, tránh giữ toàn bộ trong RAM.
+
+### 3.3. Song song
+
+2 lớp:
+
+1. **Page-level parallel**:
+   - `ONUSLIBS_PARALLEL=true`.
+   - Nhiều page trong cùng 1 window/segment được fetch song song.
+
+2. **Segment-level parallel**:
+   - `ONUSLIBS_SEGMENT_PARALLEL=true`.
+   - `ONUSLIBS_SEGMENT_MAX_WORKERS` = số worker cho segment.
+   - Nhiều segment (nhiều đoạn thời gian) chạy song song.
+
+Cả 2 đều chịu giới hạn bởi `ONUSLIBS_MAX_INFLIGHT` và `ONUSLIBS_REQ_PER_SEC`.
+
+---
+
+## 4. Module DB – Kết nối & thao tác CSDL
+
+### 4.1. Cấu hình secret DB
+
+Khuyến nghị lưu thông tin DB trong **Keyring** (cùng service với token):
+
+Ví dụ (PowerShell):
+
+```powershell
+$svc="OnusLibs"
+
+python -c "import keyring; s='$svc'; keyring.set_password(s,'DB_HOST','127.0.0.1')"
+python -c "import keyring; s='$svc'; keyring.set_password(s,'DB_PORT','3306')"
+python -c "import keyring; s='$svc'; keyring.set_password(s,'DB_USER','onusreport')"
+python -c "import keyring; s='$svc'; keyring.set_password(s,'DB_PASSWORD','xxx')"
+python -c "import keyring; s='$svc'; keyring.set_password(s,'DB_NAME','onusreport')"
+python -c "import keyring; s='$svc'; keyring.set_password(s,'DB_SSL_CA','')"  # nếu không dùng SSL
+```
+
+Hoặc qua ENV:
+
+```env
+ONUSLIBS_DB_HOST=127.0.0.1
+ONUSLIBS_DB_PORT=3306
+ONUSLIBS_DB_USER=onusreport
+ONUSLIBS_DB_PASSWORD=xxx
+ONUSLIBS_DB_NAME=onusreport
+ONUSLIBS_DB_SSL_CA=
+ONUSLIBS_DB_CONNECT_TIMEOUT=10
+```
+
+### 4.2. `DbSettings.from_secure`
+
+```python
+from onuslibs.db.settings import DbSettings
+
+db_settings = DbSettings.from_secure()               # đọc từ keyring + ENV
+db_settings = DbSettings.from_secure(fallback_env=True)  # ưu tiên ENV trước
+```
+
+- Đọc lần lượt các key DB từ ENV / Keyring.
+- Có `safe_dict()` để log cấu hình không chứa password.
+
+### 4.3. Facade `onuslibs.db` (dùng nhanh)
+
+```python
+from onuslibs.db import healthcheck, query, execute, bulk_insert
+
+print("DB OK?", healthcheck())
+
+rows = query("SELECT * FROM onchain_diary LIMIT %s", (5,))
+execute("INSERT INTO tmp_onuslibs_smoke(id, name, score) VALUES (%s,%s,%s)", (123, "smoke", 100))
+
+bulk_insert(
+    "INSERT INTO tmp_onuslibs_smoke(id, name, score) VALUES (%s,%s,%s)",
+    [(2001, "bulk-1", 10), (2002, "bulk-2", 20)],
+    batch_size=1000,
+)
+```
+
+- Lần đầu gọi sẽ tự `DbSettings.from_secure()` + tạo `DB` nội bộ.
+- Các lần sau reuse lại instance đó.
+
+### 4.4. Class `DB` (nâng cao)
+
+```python
+from onuslibs.db.settings import DbSettings
+from onuslibs.db.core import DB
+
+db = DB(DbSettings.from_secure())
+
+ok = db.healthcheck()
+rows = db.query("SELECT * FROM onchain_diary WHERE userid=%s LIMIT 10", (123,))
+affected = db.execute("UPDATE tmp_onuslibs_smoke SET score=%s WHERE id=%s", (100, 1))
 ```
 
 ---
 
-## `examples.pro_vndc_send`
+## 5. Ví dụ sử dụng trong `examples/`
 
-Test API:
+### 5.1. `examples/get_commission.py`
 
-```text
-GET /api/transfers
-  ?transferTypes=vndcacc.vndc_offchain_send_onuspro
-  &amountRange=
-  &datePeriod=...T00:00:00.000,...T23:59:59.999
-  &user=
-  &pageSize=...
-  &fields=transactionNumber,date,amount,from.user.id,from.user.display,to.user.id,to.user.display,type.internalName
+- Endpoint:
+  - `/api/vndc_commission/accounts/vndc_commission_acc/history`
+- Params:
+  - `chargedBack=false`
+  - `transferFilters=vndc_commission_acc.commission_buysell`
+  - `datePeriod = build_date_period(start_date, end_date)`
+- Fields (ví dụ):
+  - `date, transactionNumber, relatedAccount.user.id, relatedAccount.user.display, amount, description`
+- Gọi:
+
+```python
+rows = fetch_json(
+    endpoint=ENDPOINT,
+    params=params,
+    fields=FIELDS,
+    page_size=args.page_size,
+    paginate=True,
+    order_by=args.order,
+    settings=OnusSettings(),
+    unique_key="transactionNumber",
+)
 ```
 
-**Flags chính**
+### 5.2. `examples/onchain_usdt_receive.py`
 
-- `--date YYYY-MM-DD`  
-  Ngày cần lấy giao dịch `vndc_offchain_send_onuspro`.
-- `--limit-print N`  
-  Số dòng in demo ra màn hình (mặc định 5).
-- `--json`  
-  In toàn bộ kết quả ra stdout dạng JSON 1 dòng.
+- Endpoint: `/api/transfers`
+- Params:
+  - `transferFilters=usdtacc.onchain_receive`
+  - `datePeriod=build_date_period(start_date, end_date)`
+- Fields:
+  - `transactionNumber,date,amount,from.user.id,from.user.display,to.user.id,to.user.display,type.internalName`
+- Dùng để test hybrid auto-segment trên range dài (vd: 2025-11-01 → 2025-11-16).
 
-Script dùng:
+### 5.3. `examples/pro_vndc_send.py`
 
-- `build_date_period(day, day)` để build `datePeriod`,
-- `fetch_json` với:
-  - `endpoint="/api/transfers"`,
-  - `params = {transferTypes, amountRange, datePeriod, user}`,
-  - `fields` chuẩn như trên,
-  - `unique_key="transactionNumber"`.
-
-**Ví dụ**
-
-```bash
-python -m examples.pro_vndc_send --date 2025-11-11 --limit-print 10
-python -m examples.pro_vndc_send --date 2025-11-11 --json > pro_vndc_send_2025-11-11.json
-```
+- Endpoint: `/api/transfers`
+- Params:
+  - `transferTypes=vndcacc.vndc_offchain_send_onuspro`
+  - `amountRange=""`
+  - `datePeriod=build_date_period(start_date, end_date)`
+- Fields giống `onchain_usdt_receive`.
+- Hỗ trợ:
+  - `--date` hoặc `--start-date/--end-date`
+  - `--out-csv` (mặc định `files/pro_vndc_send.csv`)
 
 ---
 
-## Biến ENV (tóm tắt)
+## 6. Tóm tắt ENV quan trọng
 
 - Bắt buộc:
   - `ONUSLIBS_BASE_URL`
@@ -591,13 +480,17 @@ python -m examples.pro_vndc_send --date 2025-11-11 --json > pro_vndc_send_2025-1
 
 - Parallel & segment:
   - `ONUSLIBS_PARALLEL`
-  - `ONUSLIBS_DATE_SEGMENT_HOURS`
-  - `ONUSLIBS_SEGMENT_PARALLEL` (tương lai)
-  - `ONUSLIBS_SEGMENT_MAX_WORKERS` (tương lai)
+  - `ONUSLIBS_MAX_WINDOW_DAYS`
+  - `ONUSLIBS_MAX_ROWS_PER_WINDOW`
+  - `ONUSLIBS_AUTO_SEGMENT`
+  - `ONUSLIBS_MAX_SEGMENT_SPLIT_DEPTH`
+  - `ONUSLIBS_SEGMENT_PARALLEL`
+  - `ONUSLIBS_SEGMENT_MAX_WORKERS`
+  - `ONUSLIBS_DATE_SEGMENT_HOURS` (legacy)
 
 - Bảo mật:
-  - `ONUSLIBS_SECRETS_BACKEND=keyring|env`
-  - `ONUSLIBS_KEYRING_SERVICE=OnusLibs`
-  - `ONUSLIBS_KEYRING_ITEM=ACCESS_CLIENT_TOKEN`
-  - `ONUSLIBS_FALLBACK_ENV=true|false`
-  - Các key DB trong Keyring: `DB_HOST`, `DB_PORT`, `DB_USER`, `DB_PASSWORD`, `DB_NAME`, `DB_SSL_CA`…
+  - `ONUSLIBS_SECRETS_BACKEND`
+  - `ONUSLIBS_KEYRING_SERVICE`
+  - `ONUSLIBS_KEYRING_ITEM`
+  - `ONUSLIBS_FALLBACK_ENV`
+  - Các key DB (ENV hoặc Keyring): `DB_HOST`, `DB_PORT`, `DB_USER`, `DB_PASSWORD`, `DB_NAME`, `DB_SSL_CA`, ...
