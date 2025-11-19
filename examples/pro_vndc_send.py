@@ -8,10 +8,10 @@ Chạy mẫu:
   python -m examples.pro_vndc_send --date 2025-11-11
 
   # Lấy nhiều ngày (test hybrid auto-segment range dài)
-  python -m examples.pro_vndc_send --start-date 2025-11-01 --end-date 2025-11-16
+  python -m examples.pro_vndc_send --start-date 2025-11-0 --end-date 2025-11-15
 
   # Lấy nhiều ngày và ghi CSV mặc định
-  python -m examples.pro_vndc_send --start-date 2025-11-01 --end-date 2025-11-16 --out-csv
+  python -m examples.pro_vndc_send --start-date 2025-11-10 --end-date 2025-11-15 --out-csv
 
 Yêu cầu:
   - Đã set ENV OnusLibs, ví dụ:
