@@ -10,6 +10,11 @@ class DbSettings:
 
     - Nếu `fallback_env=True` → ưu tiên ENV trước.
     - Ngược lại đọc từ keyring trước, cuối cùng ENV là dự phòng.
+    
+    Cấu hình mới (v3.1):
+    - pool_size: Số connection tối thiểu trong pool (mặc định 5)
+    - max_overflow: Số connection tối đa có thể tạo thêm (mặc định 10)
+    - retry_count: Số lần retry khi gặp lỗi tạm thời (mặc định 3)
     """
     host: str
     user: str
@@ -18,6 +23,9 @@ class DbSettings:
     port: int = 3306
     ssl_ca: Optional[str] = None
     connect_timeout: float = 10.0  # giây
+    pool_size: int = 5
+    max_overflow: int = 10
+    retry_count: int = 3
 
     @classmethod
     def from_secure(
@@ -62,8 +70,12 @@ class DbSettings:
         name = get("ONUSLIBS_DB_NAME", "DB_NAME")
         port_str = get("ONUSLIBS_DB_PORT", "DB_PORT", "3306")
         ssl_ca = get("ONUSLIBS_DB_SSL_CA", "DB_SSL_CA")
-        # NEW: connect_timeout
+        # connect_timeout
         ct_str = get("ONUSLIBS_DB_CONNECT_TIMEOUT", "DB_CONNECT_TIMEOUT", "10")
+        # NEW v3.1: Connection pool settings
+        pool_size_str = get("ONUSLIBS_DB_POOL_SIZE", "DB_POOL_SIZE", "5")
+        max_overflow_str = get("ONUSLIBS_DB_MAX_OVERFLOW", "DB_MAX_OVERFLOW", "10")
+        retry_count_str = get("ONUSLIBS_DB_RETRY_COUNT", "DB_RETRY_COUNT", "3")
 
         # Validate trường bắt buộc
         missing = [k for k, v in {"host": host, "user": user, "password": password, "name": name}.items() if v is None]
@@ -85,6 +97,27 @@ class DbSettings:
                 raise ValueError
         except ValueError:
             raise RuntimeError(f"DbSettings.from_secure: connect_timeout không hợp lệ: {ct_str!r}")
+        
+        try:
+            pool_size = int(pool_size_str) if pool_size_str else 5
+            if pool_size < 1:
+                raise ValueError
+        except ValueError:
+            raise RuntimeError(f"DbSettings.from_secure: pool_size không hợp lệ: {pool_size_str!r}")
+        
+        try:
+            max_overflow = int(max_overflow_str) if max_overflow_str else 10
+            if max_overflow < 0:
+                raise ValueError
+        except ValueError:
+            raise RuntimeError(f"DbSettings.from_secure: max_overflow không hợp lệ: {max_overflow_str!r}")
+        
+        try:
+            retry_count = int(retry_count_str) if retry_count_str else 3
+            if retry_count < 0:
+                raise ValueError
+        except ValueError:
+            raise RuntimeError(f"DbSettings.from_secure: retry_count không hợp lệ: {retry_count_str!r}")
 
         # Chuẩn hoá ssl_ca rỗng -> None
         if ssl_ca is not None and not ssl_ca.strip():
@@ -92,7 +125,8 @@ class DbSettings:
 
         return cls(
             host=host, user=user, password=password, name=name,
-            port=port, ssl_ca=ssl_ca, connect_timeout=connect_timeout
+            port=port, ssl_ca=ssl_ca, connect_timeout=connect_timeout,
+            pool_size=pool_size, max_overflow=max_overflow, retry_count=retry_count
         )
 
     def safe_dict(self) -> dict:
@@ -108,4 +142,7 @@ class DbSettings:
             "port": self.port,
             "ssl_ca": bool(self.ssl_ca),
             "connect_timeout": self.connect_timeout,
+            "pool_size": self.pool_size,
+            "max_overflow": self.max_overflow,
+            "retry_count": self.retry_count,
         }

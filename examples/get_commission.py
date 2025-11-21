@@ -8,7 +8,7 @@ Mục tiêu:
 
 Chạy mẫu:
   python -m examples.get_commission --date 2025-10-11
-  python -m examples.get_commission --start-date 2025-10-01 --end-date 2025-10-10
+  python -m examples.get_commission --start-date 2025-10-10 --end-date 2025-10-11
 """
 
 from __future__ import annotations

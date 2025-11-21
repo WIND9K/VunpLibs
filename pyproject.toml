@@ -1,11 +1,34 @@
 [project]
 name = "onuslibs"
-version = "0.1.0"
-description = "OnusLibs - REST-first Facade for ONUS/Cyclos APIs"
+version = "0.3.1"
+description = "OnusLibs v3.1 - Enterprise-grade REST API & DB library for ONUS/Cyclos with connection pooling, retry logic, and hybrid auto-segmentation"
 readme = "README.md"
 requires-python = ">=3.10"
 authors = [{name="Vũ GPT"}]
 license = {text = "MIT"}
+keywords = [
+    "onus",
+    "cyclos",
+    "rest-api",
+    "database",
+    "connection-pool",
+    "retry",
+    "mysql",
+    "etl",
+]
+
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: Database",
+    "Topic :: Internet :: WWW/HTTP",
+]
 
 dependencies = [
     "httpx>=0.27.0",
@@ -13,12 +36,17 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-db = ["pymysql>=1.1.0"]
+db = [
+    "pymysql>=1.1.0",
+]
 dev = [
     "pytest>=7.4.0",
     "pytest-cov>=4.1.0",
     "ruff>=0.5.0",
     "mypy>=1.5.0",
+]
+all = [
+    "pymysql>=1.1.0",
 ]
 
 [build-system]
