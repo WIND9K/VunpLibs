@@ -88,6 +88,38 @@ with transaction() as conn:
     # Auto commit
 ```
 
+### Facade usage (module‑level)
+
+```python
+from onuslibs.db import (
+    query_one,
+    query_scalar,
+    bulk_upsert,
+    transaction,
+)
+
+# Lấy 1 bản ghi
+user = query_one("SELECT * FROM users WHERE id=%s", (123,))
+
+# Đếm bản ghi
+total = query_scalar("SELECT COUNT(*) FROM users")
+
+# Upsert nhiều bản ghi
+bulk_upsert(
+    table="users",
+    columns=["id", "name", "email"],
+    rows=[(1, "Alice", "a@example.com"), (2, "Bob", "b@example.com")],
+    update_columns=["name", "email"],
+)
+
+# Transaction an toàn
+with transaction() as conn:
+    with conn.cursor() as cur:
+        cur.execute("INSERT INTO orders (id, amount) VALUES (%s, %s)", (1, 100))
+        cur.execute("UPDATE inventory SET qty = qty - 1 WHERE product_id = %s", (42,))
+```
+
+
 ## 📚 Tài liệu
 
 - **[DB Module Quick Start](DB_MODULE_QUICK_START.md)** - Hướng dẫn nhanh DB v3.1
